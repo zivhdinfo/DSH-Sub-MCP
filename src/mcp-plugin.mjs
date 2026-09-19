@@ -2,7 +2,7 @@
 // Claude Code or Codex CLI (the parent) can delegate work to them.
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -62,9 +62,8 @@ function describeUsage(usage) {
   return `tokens: ${fmt(usage.inputTokens)} in (${pct}% cache hit, ${fmt(usage.uncachedInputTokens)} uncached) / ${fmt(usage.outputTokens)} out`;
 }
 
-// Append-only record of every delegation, so the control panel can show what
-// ran and what it cost even though these sessions never appear in the DSH
-// session list (they are not web sessions).
+// Append-only record of every delegation with its cost. The DSH sidebar shows
+// the sessions themselves; this is the compact cross-run view with cache ratios.
 class History {
   constructor(file, limit = 200) {
     this.file = file;
@@ -319,6 +318,39 @@ export async function apply(ctx) {
     });
   }
 
+  // Registering the server only tells the parent the tools exist. The skill (or
+  // AGENTS.md section, for Codex) is what teaches it when and how to use them.
+  const homeDir = process.env.USERPROFILE ?? process.env.HOME ?? '';
+  const skillSources = {
+    claude: path.join(projectRoot, 'skills', 'claude', 'deepseek-subagent', 'SKILL.md'),
+    codex: path.join(projectRoot, 'skills', 'codex', 'AGENTS.snippet.md'),
+  };
+
+  async function installClaudeSkill() {
+    const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude');
+    const dest = path.join(configDir, 'skills', 'deepseek-subagent', 'SKILL.md');
+    await mkdir(path.dirname(dest), { recursive: true });
+    await writeFile(dest, await readFile(skillSources.claude, 'utf8'));
+    return dest;
+  }
+
+  // Codex has no per-skill file; global guidance lives in $CODEX_HOME/AGENTS.md.
+  // The snippet is fenced with markers so re-installing replaces rather than
+  // duplicates, and the user's own content around it is left untouched.
+  async function installCodexInstructions() {
+    const dest = path.join(process.env.CODEX_HOME || path.join(homeDir, '.codex'), 'AGENTS.md');
+    const snippet = (await readFile(skillSources.codex, 'utf8')).trim();
+    let existing = '';
+    try { existing = await readFile(dest, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const fenced = /<!-- dsh-sub-mcp:start -->[\s\S]*?<!-- dsh-sub-mcp:end -->/;
+    const next = fenced.test(existing)
+      ? existing.replace(fenced, snippet)
+      : (existing.trimEnd() + (existing.trim() ? '\n\n' : '') + snippet + '\n');
+    await mkdir(path.dirname(dest), { recursive: true });
+    await writeFile(dest, next);
+    return dest;
+  }
+
   // Runs the parent agent's own CLI so registration lands wherever that CLI keeps
   // its config, instead of us guessing at config file paths. Re-registering is
   // allowed: the button replaces a stale entry rather than reporting a conflict.
@@ -339,6 +371,14 @@ export async function apply(ctx) {
       await runCli(exe, ['mcp', 'remove', 'deepseek']);
       result = await runCli(exe, addArgs);
       if (result.ok) result.output = `Replaced the previous registration. ${result.output}`;
+    }
+    if (result.ok) {
+      try {
+        const installed = target === 'claude' ? await installClaudeSkill() : await installCodexInstructions();
+        result.output += `\n${target === 'claude' ? 'Skill installed' : 'Instructions installed'}: ${installed}`;
+      } catch (error) {
+        result.output += `\nWARNING: could not install usage guidance: ${String(error.message || error)}`;
+      }
     }
     return { ...result, exe };
   }
@@ -394,8 +434,8 @@ a{color:inherit}.muted{opacity:.65;font-size:.9em}
 <p class=muted style="margin-bottom:0">
 Claude Code: ${found.claude ? '<span class=ok>' + escape(found.claude) + '</span>' : '<span class=warn>not found — will try PATH</span>'}<br>
 Codex CLI: ${found.codex ? '<span class=ok>' + escape(found.codex) + '</span>' : '<span class=warn>not found — will try PATH</span>'}<br>
-Registers over <b>stdio</b>: the next time Claude/Codex starts, it <b>launches this server itself</b> — nothing to start by hand.
-Click again at any time to replace an existing registration.</p>
+Registers over <b>stdio</b> (the parent launches this server itself next time) and installs <b>usage guidance</b>: a global skill for Claude Code (<code>~/.claude/skills/deepseek-subagent/</code>) or a fenced section in Codex's <code>~/.codex/AGENTS.md</code>, so the parent knows when and how to delegate.
+Click again at any time to refresh both.</p>
 </div>
 
 <h2>3. Allowed models</h2>

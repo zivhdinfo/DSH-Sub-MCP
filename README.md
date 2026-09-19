@@ -36,7 +36,7 @@ Everything else happens in the control panel:
 | Section | What it does |
 |---|---|
 | 1. API key | Shows whether a key is configured; if not, links to the DSH UI → Settings → Models |
-| 2. Connect a parent agent | **Buttons** that run `claude mcp add` / `codex mcp add` for you, over **stdio** so the server auto-starts. Locates the CLI binaries automatically; safe to click again |
+| 2. Connect a parent agent | **Buttons** that run `claude mcp add` / `codex mcp add` for you over **stdio** (auto-start) and install **usage guidance**: a global skill for Claude Code, a fenced section in Codex's `AGENTS.md`. Locates the CLI binaries automatically; safe to click again |
 | 3. Allowed models | **Checkboxes** to enable/disable each model; a disabled model is refused if requested |
 | 4. Recent delegations | Every run with model, status, duration, tokens in/out, **cache-hit ratio** and changed files |
 
@@ -45,6 +45,17 @@ The control panel is also reachable from a floating link inside the DSH UI.
 ### Every run is a session in the DSH UI
 
 Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[deepseek research] …` or `[deepseek code] …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically.
+
+**Stopping a run:** open the session and press **Stop** in the composer. It calls the same `agent.cancel` the harness uses for its own sessions, which aborts the turn and kills any command the agent is running (verified: a `Start-Sleep 120` was killed at cancel time and the tool returned `stopReason: aborted`). The MCP call returns immediately with the changed-file evidence.
+
+### Teaching the parent how to delegate
+
+Registering the server only makes the tools exist. The connect buttons also install guidance on *when and how* to use them:
+
+- **Claude Code:** `skills/claude/deepseek-subagent/SKILL.md` is copied to `~/.claude/skills/deepseek-subagent/` (respects `CLAUDE_CONFIG_DIR`). Its `allowed-tools` pre-approves the three MCP tools so there are no permission prompts.
+- **Codex CLI:** `skills/codex/AGENTS.snippet.md` is inserted into `~/.codex/AGENTS.md` between `<!-- dsh-sub-mcp:start/end -->` markers (respects `CODEX_HOME`). Re-connecting replaces the section; your own content around it is untouched.
+
+Edit the files under `skills/` and click connect again to redeploy them.
 
 This is deliberate. The harness's own subagent mechanism tags children with `origin: "subagent"`, and the DSH sidebar hides those unconditionally (they only render nested under a parent web session). So instead of `ctx.subagents.start`, `src/delegate.mjs` does what the in-process subagent driver does internally — create an agent, apply the persona and tool restriction in its setup window, send one user turn, read the result from the event log — but as a normal session.
 
