@@ -46,7 +46,7 @@ The control panel is also reachable from a floating link inside the DSH UI.
 
 Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[deepseek research] …` or `[deepseek code] …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically.
 
-**Stopping a run:** from the parent, `deepseek_cancel` (or Esc on a foreground call); from the DSH UI, open the session and press **Stop** in the composer. Both call the same `agent.cancel` the harness uses for its own sessions, which aborts the turn and kills any command the agent is running (verified: a `Start-Sleep 120` was killed at cancel time and the tool returned `stopReason: aborted`). The MCP result carries the changed-file evidence and the reason. A stopped session is not dead: `deepseek_continue` resumes it with its memory intact.
+**Stopping a run:** from the parent, `deepseek_cancel` (or Esc on a foreground call); from the DSH UI, open the session and press **Stop** in the composer. Both call the same `agent.cancel` the harness uses for its own sessions, which aborts the turn and kills any command the agent is running (verified: a `Start-Sleep 120` was killed at cancel time and the tool returned `stopReason: aborted`). The MCP result carries the changed-file evidence and the reason. A stopped session is not dead: `deepseek_continue` resumes it with its memory intact — also while it is open in the UI, since opening a session there turns it into a live agent the UI keeps; the follow-up then runs on that agent and you watch it in the UI.
 
 ### Teaching the parent how to delegate
 
@@ -117,7 +117,7 @@ Every delegation is a persisted DSH session, and the parent can keep working wit
 |---|---|
 | `deepseek_sessions(workspace?, status?, limit?)` | Running sessions first (elapsed, tool calls so far, last tool), then finished ones newest first with status, **why they stopped**, duration, cost and changed-file count. |
 | `deepseek_result(sessionId, waitSec?)` | The full report of a session — after a background run, after the parent's own timeout, or to re-read an old one. For a running session it waits up to `waitSec`, then reports progress instead. |
-| `deepseek_continue(sessionId, message, role?, …)` | Sends a **follow-up turn to a finished session**. The agent resumes with everything it already read and did — "carry on where you stopped", "now also handle X", or a follow-up question to a research agent. `role` can switch capability for that turn; `allowDirty` defaults to true because the tree is usually dirty from the previous turn. |
+| `deepseek_continue(sessionId, message, role?, …)` | Sends a **follow-up turn to a finished session**. The agent resumes with everything it already read and did — "carry on where you stopped", "now also handle X", or a follow-up question to a research agent. `role` can switch capability for that turn; `allowDirty` defaults to true because the tree is usually dirty from the previous turn. If the session is open in the DSH UI, the turn runs on the agent the UI holds (its model and preset, narrowed to the role's tools) and shows up there live. |
 | `deepseek_steer(sessionId, message)` | Injects a message into a **running** session; the agent reads it at its next step. |
 | `deepseek_cancel(sessionId)` | Stops a running session. Files already written stay; the record says it was cancelled and it can be continued later. |
 

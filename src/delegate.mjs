@@ -312,8 +312,13 @@ export class Delegator {
     const sessionId = brandString(resumeSessionId ?? requested ?? randomUUID());
 
     if (this.runs.has(sessionId)) throw new Error(`Session ${sessionId} is still running. Use deepseek_steer, or deepseek_cancel first.`);
-    if (resumeSessionId && this.ctx.agents.get(resumeSessionId)) {
-      throw new Error(`Session ${sessionId} is open live in the DSH UI. Continue it there, or close it there first.`);
+    // Opening a session in the DSH UI resumes it into a live agent that the UI
+    // keeps (there is no release API), so a persisted resume would collide.
+    // Borrow that agent for this turn instead: same memory, and the UI shows
+    // the turn as it happens.
+    const borrowed = resumeSessionId ? this.ctx.agents.get(sessionId) : undefined;
+    if (borrowed && borrowed.status !== 'idle') {
+      throw new Error(`Session ${sessionId} is busy in the DSH UI right now. Wait for it to finish there, or stop it in the UI, then call again.`);
     }
 
     const run = new Run({ sessionId, role, model, workspace, task, turn, guard });
@@ -339,12 +344,28 @@ export class Delegator {
         maxTokens: limits.maxOutputTokens,
         ...(reasoningEffort ? { reasoningEffort } : {}),
       };
-      handle = resumeSessionId
-        ? await this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, setup })
-        : await this.ctx.agents.create({ sessionId, meta: { cwd: workspace }, agentOptions, setup });
-
-      const agent = handle.agent;
+      let agent;
+      if (borrowed) {
+        agent = borrowed;
+        // The UI composed this agent (its preset, its model). Narrow its tools
+        // to the role for the duration of our turn; the persona is best effort
+        // since the preset may already own that section.
+        detach.push(agent.ctx.tools.restrict({ allow: write ? WRITE_TOOLS : READ_TOOLS }));
+        try {
+          detach.push(agent.ctx.systemPrompt.section({
+            name: 'deployment:persona-prefix',
+            order: agent.ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
+            text: PERSONA,
+          }));
+        } catch { /* section already owned by the UI preset */ }
+      } else {
+        handle = resumeSessionId
+          ? await this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions, setup })
+          : await this.ctx.agents.create({ sessionId, meta: { cwd: workspace }, agentOptions, setup });
+        agent = handle.agent;
+      }
       run.agent = agent;
+      if (borrowed) run.model = agent.options?.model ?? model;
       for (const [reason, signal] of Object.entries(signals)) {
         if (!signal) continue;
         const onAbort = () => run.stop(reason);
@@ -377,6 +398,7 @@ export class Delegator {
         .join('\n')
         .trim();
       const notes = [];
+      if (borrowed) notes.push(`ran on the agent the DSH UI holds for this session (model ${run.model}); the UI shows this turn`);
       if (run.abortReason) notes.push(describeAbort(run.abortReason, limits));
       else if (guard.exhausted) notes.push(`tool call budget of ${limits.maxToolCalls} was exhausted; the report may be partial`);
       else if (guard.denials) notes.push(`${guard.denials} call${guard.denials === 1 ? '' : 's'} blocked by the loop guard`);
@@ -385,16 +407,19 @@ export class Delegator {
         turn,
         stopReason,
         abortReason: run.abortReason,
+        model: run.model,
         text,
         diagnostic: notes.join('; '),
         toolCalls: guard.calls,
         denials: guard.denials,
       };
     } finally {
-      for (const off of detach) off();
+      // Signal listeners, and the temporary restriction/persona on a borrowed agent.
+      for (const off of detach) { try { await off(); } catch { /* already unwound */ } }
       this.runs.delete(sessionId);
       // Disposing releases the live agent; the session stays persisted and keeps
-      // showing in the sidebar as a cold session, ready to be resumed.
+      // showing in the sidebar as a cold session, ready to be resumed. A
+      // borrowed agent belongs to the UI and is left as found.
       await handle?.dispose();
     }
   }

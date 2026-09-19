@@ -32,7 +32,7 @@ The `deepseek` MCP server runs a real DeepSeek agent — with file and shell too
 
 ## When a run stops early
 
-The result says why: `timeout`, the loop guard (budget exhausted or the same call repeating with no edits between), `deepseek_cancel`, or you disconnecting. Partial edits are listed under `Files changed`. **Do not start over** — `deepseek_continue({ sessionId, message: "You were stopped after X; finish Y and Z, then run the tests" })` resumes with the agent's memory intact (`allowDirty` defaults to true there because the tree is dirty from the previous turn). Review the diff before and after.
+The result says why: `timeout`, the loop guard (budget exhausted or the same call repeating with no edits between), `deepseek_cancel`, or you disconnecting. Partial edits are listed under `Files changed`. **Do not start over** — `deepseek_continue({ sessionId, message: "You were stopped after X; finish Y and Z, then run the tests" })` resumes with the agent's memory intact (`allowDirty` defaults to true there because the tree is dirty from the previous turn). It also works while the session is open in the DSH UI; only a session that is *busy* there is refused. Review the diff before and after.
 
 ## Reading a result
 

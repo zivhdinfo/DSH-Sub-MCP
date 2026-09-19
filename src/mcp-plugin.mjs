@@ -252,6 +252,9 @@ export async function apply(ctx) {
         const changed = diffStatus(before, after);
         const durationMs = Date.now() - startedAt;
         const status = failed ? result.stopReason : 'completed';
+        // A turn run on the agent the DSH UI holds uses that agent's model.
+        const usedModel = result.model ?? picked.model;
+        header[0] = `model: ${usedModel}`;
         const body = [
           header.join(' | '),
           `stopReason: ${result.stopReason} | tool calls: ${result.toolCalls} | ${(durationMs / 1000).toFixed(1)}s`,
@@ -267,6 +270,7 @@ export async function apply(ctx) {
         ].join('\n');
         await history.finish(record, {
           status,
+          model: usedModel,
           reason: result.diagnostic || undefined,
           durationMs,
           toolCalls: result.toolCalls,
@@ -274,7 +278,7 @@ export async function apply(ctx) {
           usage,
         });
         await saveResult(sessionId, {
-          sessionId, turn, time: record.time, role, model: picked.model, workspace: ws, task: task.slice(0, 160),
+          sessionId, turn, time: record.time, role, model: usedModel, workspace: ws, task: task.slice(0, 160),
           status, stopReason: result.stopReason, abortReason: result.abortReason, diagnostic: result.diagnostic,
           durationMs, toolCalls: result.toolCalls, changedFiles: changed ?? null, usage, text: result.text, body,
         }).catch(() => {});
