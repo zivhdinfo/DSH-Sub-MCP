@@ -146,6 +146,16 @@ function describeChanges(before, after) {
 
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 
+// Sidebar title: "[Code] - store-main: fix the nav overflow…". The mode and the
+// project folder come first so a list of sessions scans by eye; the harness
+// caps titles at 80 bytes, so the task excerpt is short.
+const MODE_LABEL = { code: 'Code', research: 'Research' };
+function sessionTitleFor(role, workspace, task) {
+  const folder = path.basename(workspace) || workspace;
+  const excerpt = task.replace(/\s+/g, ' ').trim().slice(0, 60);
+  return `[${MODE_LABEL[role] ?? role}] - ${folder}: ${excerpt}`;
+}
+
 function requireSessionId(value) {
   if (typeof value !== 'string' || !SESSION_ID.test(value)) throw new Error('sessionId must be the id shown by deepseek_sessions or a previous result.');
   return value.toLowerCase();
@@ -235,7 +245,7 @@ export async function apply(ctx) {
           workspace: ws,
           model: picked.model,
           signals: { timeout, 'client-disconnect': client },
-          title: `[deepseek ${role}] ${task.replace(/\s+/g, ' ').slice(0, 70)}`,
+          title: sessionTitleFor(role, ws, task),
           maxToolCalls: budget,
           sessionId,
           resumeSessionId: resume ? sessionId : undefined,

@@ -44,7 +44,7 @@ The control panel is also reachable from a floating link inside the DSH UI.
 
 ### Every run is a session in the DSH UI
 
-Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[deepseek research] …` or `[deepseek code] …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically.
+Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[Research] - <project folder>: …` or `[Code] - <project folder>: …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically.
 
 **Stopping a run:** from the parent, `deepseek_cancel` (or Esc on a foreground call); from the DSH UI, open the session and press **Stop** in the composer. Both call the same `agent.cancel` the harness uses for its own sessions, which aborts the turn and kills any command the agent is running (verified: a `Start-Sleep 120` was killed at cancel time and the tool returned `stopReason: aborted`). The MCP result carries the changed-file evidence and the reason. A stopped session is not dead: `deepseek_continue` resumes it with its memory intact — also while it is open in the UI, since opening a session there turns it into a live agent the UI keeps; the follow-up then runs on that agent and you watch it in the UI.
 
