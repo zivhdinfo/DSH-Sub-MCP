@@ -1,6 +1,6 @@
 // Exposes DeepSeek agents running inside this DSH harness as MCP tools, so that
 // Claude Code or Codex CLI (the parent) can delegate work to them.
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync, readdirSync } from 'node:fs';
@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Catalog } from './models.mjs';
-import { Delegator, readUsage } from './delegate.mjs';
+import { Delegator, readUsage, usageDelta, TOOL_CALL_BOUNDS, DEFAULT_LIMITS } from './delegate.mjs';
 import { validateWorkspace, gitStatus, diffStatus } from './workspace.mjs';
 import { home, projectRoot } from './bootstrap.mjs';
 
@@ -19,7 +19,12 @@ export const inject = ['webServer', 'credentials', 'agents', 'tools', 'connectio
 const ROUTE = '/mcp';
 const MAX_BODY = 1 << 20;
 const DEFAULT_TIMEOUT_SEC = 900;
+// How often a running foreground call reports progress to the parent even when
+// the agent is inside one long tool call (a test suite, say).
+const PROGRESS_INTERVAL_MS = 10000;
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const tokenFile = path.join(home, 'mcp-token.txt');
+const resultsDir = path.join(home, 'results');
 
 async function ensureToken() {
   try {
@@ -64,8 +69,11 @@ function describeUsage(usage) {
 
 // Append-only record of every delegation with its cost. The DSH sidebar shows
 // the sessions themselves; this is the compact cross-run view with cache ratios.
+// A run is recorded when it STARTS (status "running") and patched when it ends,
+// so the list is truthful while a background run is in flight and after a
+// crash: anything still "running" when the harness boots did not finish.
 class History {
-  constructor(file, limit = 200) {
+  constructor(file, limit = 300) {
     this.file = file;
     this.limit = limit;
     this.entries = [];
@@ -75,14 +83,34 @@ class History {
       const raw = JSON.parse(await readFile(this.file, 'utf8'));
       if (Array.isArray(raw)) this.entries = raw.slice(-this.limit);
     } catch { /* first run */ }
+    let orphaned = false;
+    for (const entry of this.entries) {
+      if (entry.status !== 'running') continue;
+      entry.status = 'interrupted';
+      entry.reason = 'the harness restarted while the run was in flight';
+      orphaned = true;
+    }
+    if (orphaned) await this.persist();
   }
-  async add(entry) {
-    this.entries.push(entry);
+  async start(entry) {
+    const record = { id: randomUUID(), ...entry, status: 'running' };
+    this.entries.push(record);
     if (this.entries.length > this.limit) this.entries.splice(0, this.entries.length - this.limit);
+    await this.persist();
+    return record;
+  }
+  async finish(record, patch) {
+    Object.assign(record, patch);
     await this.persist();
   }
   async persist() {
     await writeFile(this.file, JSON.stringify(this.entries, null, 2), { mode: 0o600 }).catch(() => {});
+  }
+  latestForSession(sessionId) {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      if (this.entries[i].sessionId === sessionId) return this.entries[i];
+    }
+    return undefined;
   }
   // Accounting that was still settling when the run returned gets picked up
   // the next time anyone looks, so the panel converges to the real numbers.
@@ -98,6 +126,16 @@ class History {
   recent(n = 30) { return this.entries.slice(-n).reverse(); }
 }
 
+// The agent's final report, kept per session so the parent can read it after
+// a background run, after its own timeout, or from a later conversation.
+async function saveResult(sessionId, result) {
+  await mkdir(resultsDir, { recursive: true });
+  await writeFile(path.join(resultsDir, `${sessionId}.json`), JSON.stringify(result, null, 2), { mode: 0o600 });
+}
+async function loadResult(sessionId) {
+  try { return JSON.parse(await readFile(path.join(resultsDir, `${sessionId}.json`), 'utf8')); } catch { return null; }
+}
+
 function describeChanges(before, after) {
   if (!after) return 'Workspace is not a git repo — no file-change evidence available.';
   const changed = diffStatus(before, after);
@@ -106,30 +144,49 @@ function describeChanges(before, after) {
   return `Files changed (${changed.length}):\n` + changed.map(c => `  ${c.status || '??'} ${c.path}`).join('\n');
 }
 
+const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+
+function requireSessionId(value) {
+  if (typeof value !== 'string' || !SESSION_ID.test(value)) throw new Error('sessionId must be the id shown by deepseek_sessions or a previous result.');
+  return value.toLowerCase();
+}
+
 export async function apply(ctx) {
   const token = await ensureToken();
   const catalog = new Catalog(home);
   const delegator = new Delegator(ctx);
   const history = new History(path.join(home, 'delegations.json'));
   const resolveKey = async () => (await ctx.credentials.resolve('DEEPSEEK_API_KEY'))?.value ?? null;
+  // sessionId → promise of the finished body, so deepseek_result can wait on a
+  // run that is still in flight (background, or one the parent gave up on).
+  const pending = new Map();
 
   await catalog.load();
   await history.load();
   // Warm the catalog from the live API without blocking boot.
   catalog.refresh(resolveKey).catch(() => {});
 
-  async function delegate(role, { task, workspace, model, timeoutSec, allowDirty }, extra) {
+  const text = (body, isError = false) => ({ content: [{ type: 'text', text: body }], isError });
+  const json = value => text(JSON.stringify(value, null, 2));
+
+  // One delegation turn: a fresh session, or a follow-up turn on a persisted
+  // one (`resume` is that session's latest history entry).
+  async function startRun({ role, task, workspace, model, timeoutSec, allowDirty, background, maxToolCalls, resume }, extra) {
     if (typeof task !== 'string' || !task.trim()) throw new Error('task must not be empty.');
     if (task.length > 32000) throw new Error('task is limited to 32,000 characters.');
     const ws = await validateWorkspace(workspace, home);
     const picked = catalog.resolve(model);
 
     const seconds = Math.min(Math.max(Number(timeoutSec) || DEFAULT_TIMEOUT_SEC, 30), 3600);
-    const signals = [AbortSignal.timeout(seconds * 1000)];
-    if (extra?.signal) signals.push(extra.signal);
-    const signal = AbortSignal.any(signals);
+    const budget = maxToolCalls === undefined
+      ? undefined
+      : Math.min(Math.max(Math.floor(Number(maxToolCalls)), TOOL_CALL_BOUNDS.min), TOOL_CALL_BOUNDS.max);
+    const timeout = AbortSignal.timeout(seconds * 1000);
+    // A foreground run dies with its request (the parent cancelled, timed out,
+    // or went away). A background run answers only to timeoutSec and deepseek_cancel.
+    const client = background ? undefined : extra?.signal;
 
-    const before = await gitStatus(ws, signal);
+    const before = await gitStatus(ws, timeout);
     if (role === 'code' && allowDirty !== true && before && before.length) {
       throw new Error(
         `Workspace has ${before.length} uncommitted changes. `
@@ -137,75 +194,190 @@ export async function apply(ctx) {
       );
     }
 
-    const header = [`model: ${picked.model}`, `role: ${role}`, `workspace: ${ws}`];
+    const sessionId = resume ? resume.sessionId : randomUUID();
+    const turn = resume ? (resume.turn ?? 1) + 1 : 1;
+    const header = [`model: ${picked.model}`, `role: ${role}`, `workspace: ${ws}`, `session: ${sessionId}${turn > 1 ? ` (turn ${turn})` : ''}`];
     if (picked.warning) header.push(`WARNING: ${picked.warning}`);
 
     const startedAt = Date.now();
-    const record = {
+    const record = await history.start({
       time: new Date(startedAt).toISOString(),
       role,
       model: picked.model,
       workspace: ws,
       task: task.slice(0, 160),
+      sessionId,
+      turn,
+      background: Boolean(background),
+    });
+    const usageBefore = resume ? await readUsage(home, sessionId, { waitMs: 0 }) : null;
+
+    // Progress notifications keep the parent's idle timer alive during a long
+    // call and show what the agent is doing right now.
+    const progressToken = extra?._meta?.progressToken;
+    let lastProgress = 0;
+    const report = (run, force = false) => {
+      if (progressToken === undefined || background || !extra?.sendNotification) return;
+      const now = Date.now();
+      if (!force && now - lastProgress < 3000) return;
+      lastProgress = now;
+      const s = run.snapshot();
+      const message = `deepseek ${role} · ${Math.round(s.elapsedMs / 1000)}s · ${s.toolCalls} tool calls${s.lastTool ? ` · ${s.lastTool}` : ''}`;
+      extra.sendNotification({ method: 'notifications/progress', params: { progressToken, progress: s.toolCalls, message } }).catch(() => {});
     };
 
-    try {
-      const result = await delegator.run({
-        role,
-        task,
-        workspace: ws,
-        model: picked.model,
-        signal,
-        title: `[deepseek ${role}] ${task.replace(/\s+/g, ' ').slice(0, 70)}`,
-      });
-      const [after, usage] = await Promise.all([gitStatus(ws), readUsage(home, result.sessionId)]);
-      const failed = result.stopReason !== 'completed' || !result.text;
-      const changed = diffStatus(before, after);
-      await history.add({
-        ...record,
-        status: failed ? result.stopReason : 'completed',
-        durationMs: Date.now() - startedAt,
-        toolCalls: result.toolCalls,
-        changedFiles: changed?.length ?? null,
-        usage,
-        sessionId: result.sessionId,
-      });
-      const body = [
+    let ticker = null;
+    const done = (async () => {
+      try {
+        const result = await delegator.run({
+          role,
+          task,
+          workspace: ws,
+          model: picked.model,
+          signals: { timeout, 'client-disconnect': client },
+          title: `[deepseek ${role}] ${task.replace(/\s+/g, ' ').slice(0, 70)}`,
+          maxToolCalls: budget,
+          sessionId,
+          resumeSessionId: resume ? sessionId : undefined,
+          turn,
+          onStart: run => {
+            run.onProgress = () => report(run);
+            report(run, true);
+            ticker = setInterval(() => report(run, true), PROGRESS_INTERVAL_MS);
+          },
+        });
+        const [after, usageTotal] = await Promise.all([gitStatus(ws), readUsage(home, sessionId, { after: usageBefore })]);
+        const usage = resume ? usageDelta(usageTotal, usageBefore) : usageTotal;
+        const failed = result.stopReason !== 'completed' || !result.text;
+        const changed = diffStatus(before, after);
+        const durationMs = Date.now() - startedAt;
+        const status = failed ? result.stopReason : 'completed';
+        const body = [
+          header.join(' | '),
+          `stopReason: ${result.stopReason} | tool calls: ${result.toolCalls} | ${(durationMs / 1000).toFixed(1)}s`,
+          describeUsage(usage),
+          ...(result.diagnostic ? [`diagnostic: ${result.diagnostic}`] : []),
+          ...(failed && !result.diagnostic
+            ? ['hint: check the DeepSeek API key in the GUI (Settings → Models) and your account quota.']
+            : []),
+          ...(failed ? [`To pick up where it stopped: deepseek_continue({ sessionId: "${sessionId}", message: "..." })`] : []),
+          describeChanges(before, after),
+          '',
+          result.text || '(agent returned no text content)',
+        ].join('\n');
+        await history.finish(record, {
+          status,
+          reason: result.diagnostic || undefined,
+          durationMs,
+          toolCalls: result.toolCalls,
+          changedFiles: changed?.length ?? null,
+          usage,
+        });
+        await saveResult(sessionId, {
+          sessionId, turn, time: record.time, role, model: picked.model, workspace: ws, task: task.slice(0, 160),
+          status, stopReason: result.stopReason, abortReason: result.abortReason, diagnostic: result.diagnostic,
+          durationMs, toolCalls: result.toolCalls, changedFiles: changed ?? null, usage, text: result.text, body,
+        }).catch(() => {});
+        return { body, failed };
+      } catch (error) {
+        // Report the damage even on failure: an aborted write-mode agent can leave
+        // partial edits, and the parent needs to see them to recover.
+        const message = String(error.message || error);
+        const after = await gitStatus(ws).catch(() => null);
+        const changed = diffStatus(before, after);
+        const durationMs = Date.now() - startedAt;
+        const body = [header.join(' | '), `FAILED: ${message}`, describeChanges(before, after)].join('\n');
+        await history.finish(record, { status: 'failed', error: message.slice(0, 300), durationMs, changedFiles: changed?.length ?? null });
+        await saveResult(sessionId, {
+          sessionId, turn, time: record.time, role, model: picked.model, workspace: ws, task: task.slice(0, 160),
+          status: 'failed', error: message, durationMs, changedFiles: changed ?? null, text: '', body,
+        }).catch(() => {});
+        return { body, failed: true };
+      } finally {
+        if (ticker) clearInterval(ticker);
+      }
+    })();
+    pending.set(sessionId, done);
+    const release = () => { if (pending.get(sessionId) === done) pending.delete(sessionId); };
+    done.then(release, release);
+
+    if (background) {
+      return text([
         header.join(' | '),
-        `stopReason: ${result.stopReason} | tool calls: ${result.toolCalls} | ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
-        describeUsage(usage),
-        ...(result.diagnostic ? [`diagnostic: ${result.diagnostic}`] : []),
-        ...(failed && !result.diagnostic
-          ? ['hint: check the DeepSeek API key in the GUI (Settings → Models) and your account quota.']
-          : []),
-        describeChanges(before, after),
-        '',
-        result.text || '(agent returned no text content)',
-      ].join('\n');
-      return { content: [{ type: 'text', text: body }], isError: failed };
-    } catch (error) {
-      // Report the damage even on failure: an aborted write-mode agent can leave
-      // partial edits, and the parent needs to see them to recover.
-      const after = await gitStatus(ws).catch(() => null);
-      await history.add({
-        ...record,
-        status: 'failed',
-        durationMs: Date.now() - startedAt,
-        error: String(error.message || error).slice(0, 300),
-        changedFiles: diffStatus(before, after)?.length ?? null,
-      });
-      const body = [
-        header.join(' | '),
-        `FAILED: ${String(error.message || error)}`,
-        describeChanges(before, after),
-      ].join('\n');
-      return { content: [{ type: 'text', text: body }], isError: true };
+        'status: running in the background',
+        `Poll with deepseek_result({ sessionId: "${sessionId}", waitSec: 60 }) or list with deepseek_sessions. `
+        + `Stop it with deepseek_cancel; nudge it with deepseek_steer. It stops on its own after ${seconds}s.`,
+      ].join('\n'));
     }
+    const { body, failed } = await done;
+    return text(body, failed);
+  }
+
+  function delegate(role, args, extra) {
+    return startRun({ role, ...args }, extra);
+  }
+
+  // The cross-run view: live runs first, then the newest record per session.
+  function listSessions({ workspace, status = 'all', limit = 20 } = {}) {
+    const rows = [];
+    const seen = new Set();
+    // The first record of a session carries the original task; later turns
+    // only carry their follow-up message.
+    const turns = new Map();
+    const first = new Map();
+    for (const e of history.entries) {
+      if (!e.sessionId) continue;
+      turns.set(e.sessionId, (turns.get(e.sessionId) ?? 0) + 1);
+      if (!first.has(e.sessionId)) first.set(e.sessionId, e);
+    }
+    for (const run of delegator.list()) {
+      const s = run.snapshot();
+      const entry = history.latestForSession(run.sessionId);
+      const origin = first.get(run.sessionId);
+      rows.push({
+        ...s,
+        task: origin?.task ?? run.task.slice(0, 160),
+        ...(origin && origin !== entry ? { lastMessage: entry?.task } : {}),
+        time: entry?.time ?? new Date(run.startedAt).toISOString(),
+        turns: turns.get(run.sessionId) ?? 1,
+        background: entry?.background ?? false,
+      });
+      seen.add(run.sessionId);
+    }
+    for (let i = history.entries.length - 1; i >= 0; i--) {
+      const e = history.entries[i];
+      if (!e.sessionId || seen.has(e.sessionId)) continue;
+      seen.add(e.sessionId);
+      const origin = first.get(e.sessionId);
+      rows.push({
+        sessionId: e.sessionId,
+        status: e.status,
+        reason: e.reason ?? e.error ?? undefined,
+        role: e.role,
+        model: e.model,
+        workspace: e.workspace,
+        task: origin.task,
+        ...(origin !== e ? { lastMessage: e.task } : {}),
+        time: e.time,
+        turn: e.turn ?? 1,
+        turns: turns.get(e.sessionId),
+        durationMs: e.durationMs ?? null,
+        toolCalls: e.toolCalls ?? null,
+        changedFiles: e.changedFiles ?? null,
+        usage: e.usage ? { inputTokens: e.usage.inputTokens, outputTokens: e.usage.outputTokens, cacheHitRatio: Number((e.usage.cacheHitRatio ?? 0).toFixed(3)) } : null,
+        background: e.background ?? false,
+        continuable: e.status !== 'running',
+      });
+    }
+    return rows
+      .filter(r => !workspace || samePath(r.workspace, workspace))
+      .filter(r => status === 'all' || (status === 'running' ? r.status === 'running' : r.status !== 'running'))
+      .slice(0, limit);
   }
 
   function buildServer() {
     const server = new McpServer(
-      { name: 'dsh-deepseek-subagent', version: '1.0.0' },
+      { name: 'dsh-deepseek-subagent', version: '1.1.0' },
       { capabilities: { tools: {} } },
     );
 
@@ -220,21 +392,29 @@ export async function apply(ctx) {
       },
     }, async ({ refresh }, extra) => {
       const snapshot = await catalog.refresh(resolveKey, { force: refresh === true, signal: extra?.signal });
-      return { content: [{ type: 'text', text: JSON.stringify(snapshot, null, 2) }] };
+      return json(snapshot);
     });
 
+    const runOptions = {
+      model: z.string().optional().describe('DeepSeek model id. Leave empty for the default. See deepseek_models.'),
+      timeoutSec: z.number().int().min(30).max(3600).optional().describe(`Time limit in seconds, default ${DEFAULT_TIMEOUT_SEC}.`),
+      maxToolCalls: z.number().int().min(TOOL_CALL_BOUNDS.min).max(TOOL_CALL_BOUNDS.max).optional()
+        .describe(`Tool call budget for the agent, default ${DEFAULT_LIMITS.maxToolCalls}. Raise it for tasks touching many files.`),
+      background: z.boolean().optional()
+        .describe('Return immediately with the sessionId and let the agent run on. Read the report later with deepseek_result. Use for anything that may take more than a few minutes.'),
+    };
     const shared = {
       task: z.string().describe('A self-contained task with full context. The DeepSeek agent cannot see your conversation.'),
       workspace: z.string().describe('Absolute path to the project directory. Usually your current working directory.'),
-      model: z.string().optional().describe('DeepSeek model id. Leave empty for the default. See deepseek_models.'),
-      timeoutSec: z.number().int().min(30).max(3600).optional().describe(`Time limit in seconds, default ${DEFAULT_TIMEOUT_SEC}.`),
+      ...runOptions,
     };
 
     server.registerTool('deepseek_research', {
       title: 'DeepSeek read & analyse (read-only)',
       description:
         'Delegate an ANALYSIS task to a local DeepSeek agent. The agent can only read files (read/glob/grep); '
-        + 'it does NOT edit files and does NOT run commands. Use it to review code, find bugs, explain a module, or survey a codebase.',
+        + 'it does NOT edit files and does NOT run commands. Use it to review code, find bugs, explain a module, or survey a codebase. '
+        + 'The result names the sessionId; deepseek_continue can ask that same agent follow-up questions.',
       inputSchema: shared,
     }, (args, extra) => delegate('research', args, extra));
 
@@ -243,12 +423,113 @@ export async function apply(ctx) {
       description:
         'Delegate a CODE-CHANGE task to a local DeepSeek agent. The agent can read, write, edit files and run commands '
         + 'inside the workspace. Refuses to run on a dirty git tree (unless allowDirty=true) so a rollback point always exists. '
-        + 'The result always includes the list of changed files.',
+        + 'The result always includes the list of changed files and the sessionId, which deepseek_continue can resume if the run stopped early.',
       inputSchema: {
         ...shared,
         allowDirty: z.boolean().optional().describe('Allow running even if the workspace has uncommitted changes.'),
       },
     }, (args, extra) => delegate('code', args, extra));
+
+    server.registerTool('deepseek_sessions', {
+      title: 'List DeepSeek sessions',
+      description:
+        'Lists delegations made through this server: running ones first (with elapsed time, tool calls so far and the last tool), '
+        + 'then finished ones newest first with status, why they stopped, duration, cost and changed-file count. '
+        + 'Any finished session can be resumed with deepseek_continue; a running one can be stopped with deepseek_cancel or nudged with deepseek_steer.',
+      inputSchema: {
+        workspace: z.string().optional().describe('Only sessions for this workspace path.'),
+        status: z.enum(['running', 'finished', 'all']).optional().describe('Filter by state. Default all.'),
+        limit: z.number().int().min(1).max(100).optional().describe('Maximum rows, default 20.'),
+      },
+    }, async args => json(listSessions(args)));
+
+    server.registerTool('deepseek_result', {
+      title: 'Read a DeepSeek session result',
+      description:
+        'Returns the final report of a delegation: the same text deepseek_research/deepseek_code return, including stopReason, cost and changed files. '
+        + 'For a run that is still going, waits up to waitSec for it to finish and otherwise reports its progress. '
+        + 'Use it after background: true, after your own call timed out, or to re-read an earlier result.',
+      inputSchema: {
+        sessionId: z.string().describe('Session id from a result header or deepseek_sessions.'),
+        waitSec: z.number().int().min(0).max(600).optional().describe('How long to wait for a running session before reporting progress instead. Default 0.'),
+      },
+    }, async ({ sessionId, waitSec }) => {
+      const id = requireSessionId(sessionId);
+      const inFlight = pending.get(id);
+      if (inFlight) {
+        const wait = Math.min(Math.max(Number(waitSec) || 0, 0), 600) * 1000;
+        const outcome = wait > 0
+          ? await Promise.race([inFlight, new Promise(r => setTimeout(() => r(undefined), wait))])
+          : undefined;
+        if (outcome) return text(outcome.body, outcome.failed);
+        const run = delegator.get(id);
+        return json({ ...(run ? run.snapshot() : { sessionId: id, status: 'running' }), hint: 'still running — call again with waitSec, or deepseek_cancel to stop it' });
+      }
+      const stored = await loadResult(id);
+      if (stored) return text(stored.body, stored.status !== 'completed');
+      const entry = history.latestForSession(id);
+      if (!entry) throw new Error(`Unknown session ${id}. deepseek_sessions lists the ones this server knows.`);
+      return json({ ...entry, note: 'no report is stored for this session (it predates result storage, or the harness restarted mid-run); the session itself can still be continued' });
+    });
+
+    server.registerTool('deepseek_continue', {
+      title: 'Continue a DeepSeek session',
+      description:
+        'Sends a follow-up turn to a FINISHED delegation and returns its new report. The agent resumes with everything it already read and did, '
+        + 'so this is the cheap way to say "carry on where you stopped", "now also handle X", or to ask a research agent a follow-up question. '
+        + 'The tree is usually dirty from the previous turn, so allowDirty defaults to true here.',
+      inputSchema: {
+        sessionId: z.string().describe('Session id from a result header or deepseek_sessions.'),
+        message: z.string().describe('The follow-up instruction. Refer to the previous work; do not repeat the whole original task.'),
+        role: z.enum(['research', 'code']).optional().describe('Change the agent\'s capability for this turn. Default: the role the session was started with.'),
+        allowDirty: z.boolean().optional().describe('Default true for a continuation.'),
+        ...runOptions,
+      },
+    }, async ({ sessionId, message, role, allowDirty, ...options }, extra) => {
+      const id = requireSessionId(sessionId);
+      if (delegator.get(id)) throw new Error(`Session ${id} is still running. Use deepseek_steer to talk to it, or deepseek_cancel first.`);
+      const entry = history.latestForSession(id);
+      if (!entry) throw new Error(`Unknown session ${id}. Only sessions created by this server can be continued; deepseek_sessions lists them.`);
+      return startRun({
+        ...options,
+        role: role ?? entry.role,
+        task: message,
+        workspace: entry.workspace,
+        model: options.model ?? entry.model,
+        allowDirty: allowDirty ?? true,
+        resume: entry,
+      }, extra);
+    });
+
+    server.registerTool('deepseek_cancel', {
+      title: 'Stop a running DeepSeek session',
+      description: 'Stops a delegation that is still running (background or foreground). Files it already wrote stay on disk; the result records why it stopped and can be continued later.',
+      inputSchema: { sessionId: z.string().describe('Session id from deepseek_sessions.') },
+    }, async ({ sessionId }) => {
+      const id = requireSessionId(sessionId);
+      const run = delegator.get(id);
+      if (!run) throw new Error(`Session ${id} is not running.`);
+      const first = run.stop('cancelled');
+      return text(first
+        ? `Cancel requested for ${id}. deepseek_result will show how it ended and what changed on disk.`
+        : `Session ${id} is already stopping (${run.abortReason}).`);
+    });
+
+    server.registerTool('deepseek_steer', {
+      title: 'Send a message to a running DeepSeek session',
+      description: 'Injects an instruction into a delegation that is still running; the agent reads it at its next step. Use it to add a constraint, redirect it, or tell it to wrap up and report.',
+      inputSchema: {
+        sessionId: z.string().describe('Session id from deepseek_sessions.'),
+        message: z.string().describe('What to tell the agent.'),
+      },
+    }, async ({ sessionId, message }) => {
+      const id = requireSessionId(sessionId);
+      if (typeof message !== 'string' || !message.trim()) throw new Error('message must not be empty.');
+      const run = delegator.get(id);
+      if (!run) throw new Error(`Session ${id} is not running; use deepseek_continue for a finished session.`);
+      run.steer(`Message from the parent agent while you work:\n${message.slice(0, 8000)}`);
+      return text(`Delivered to ${id}; the agent picks it up at its next step.`);
+    });
 
     return server;
   }
@@ -387,12 +668,22 @@ export async function apply(ctx) {
     const runRow = r => {
       const u = r.usage;
       const when = new Date(r.time).toLocaleTimeString('en-GB', { hour12: false });
+      const running = r.status === 'running';
+      const live = running ? delegator.get(r.sessionId) : null;
       const status = r.status === 'completed'
         ? '<span class=ok>completed</span>'
-        : `<span class=bad title="${escape(r.error ?? '')}">${escape(r.status)}</span>`;
-      return `<tr title="${escape(r.task)}">
-<td>${escape(when)}</td><td>${escape(r.role)}</td><td><code>${escape(r.model)}</code></td><td>${status}</td>
-<td>${(r.durationMs / 1000).toFixed(0)}s</td>
+        : running
+          ? '<span class=warn>running</span>'
+          : `<span class=bad>${escape(r.status)}</span>`;
+      const reason = live
+        ? `${live.guard.calls} calls · ${escape(live.guard.last?.summary ?? 'starting')}`
+        : escape(r.reason ?? r.error ?? '');
+      const seconds = running ? (Date.now() - Date.parse(r.time)) / 1000 : (r.durationMs ?? 0) / 1000;
+      const turn = (r.turn ?? 1) > 1 ? ` <span class=muted>t${escape(r.turn)}</span>` : '';
+      return `<tr title="${escape(r.task)}&#10;session ${escape(r.sessionId ?? '')}">
+<td>${escape(when)}</td><td>${escape(r.role)}${turn}</td><td><code>${escape(r.model)}</code></td><td>${status}</td>
+<td class=muted style="max-width:16rem">${reason}</td>
+<td>${seconds.toFixed(0)}s</td>
 <td>${u ? `${fmt(u.inputTokens)} / ${fmt(u.outputTokens)}` : '—'}</td>
 <td>${u ? `<span class=${u.cacheHitRatio >= 0.5 ? 'ok' : 'warn'}>${(u.cacheHitRatio * 100).toFixed(0)}%</span>` : '—'}</td>
 <td>${r.changedFiles ?? '—'}</td></tr>`;
@@ -449,15 +740,18 @@ A disabled model is refused if Claude/Codex requests it.</p>
 
 <h2>4. Recent delegations</h2>
 <div class=card>
-${runs.length ? `<table><tr><th>When</th><th>Role</th><th>Model</th><th>Status</th><th>Time</th><th>Tokens in / out</th><th>Cache hit</th><th>Files</th></tr>${runs.map(runRow).join('')}</table>
-<p class=muted style="margin-bottom:0">${escape(runs.length)} most recent, of ${escape(totalRuns)} recorded. Sessions live under <code>.dsh-sub/sessions/</code>; add the workspace in the DSH sidebar to browse them there.</p>`
+${runs.length ? `<table><tr><th>When</th><th>Role</th><th>Model</th><th>Status</th><th>Why / now</th><th>Time</th><th>Tokens in / out</th><th>Cache hit</th><th>Files</th></tr>${runs.map(runRow).join('')}</table>
+<p class=muted style="margin-bottom:0">${escape(runs.length)} most recent, of ${escape(totalRuns)} recorded. Hover a row for the task and session id. Sessions live under <code>.dsh-sub/sessions/</code>; add the workspace in the DSH sidebar to browse them there. Reports are kept in <code>.dsh-sub/results/</code> and any finished session can be resumed with <code>deepseek_continue</code>.</p>`
   : '<span class=muted>No delegations yet. They will appear here as Claude/Codex calls the tools.</span>'}
 </div>
 
 <h2>How to use</h2>
 <div class=card>In Claude Code, just ask naturally:<br>
 <em>"use deepseek to review the auth module for bugs"</em> &rarr; <code>deepseek_research</code><br>
-<em>"use deepseek to fix that bug"</em> &rarr; <code>deepseek_code</code><br><br>
+<em>"use deepseek to fix that bug"</em> &rarr; <code>deepseek_code</code><br>
+<em>"ask deepseek to carry on where it stopped"</em> &rarr; <code>deepseek_continue</code><br>
+<em>"what is deepseek doing?"</em> &rarr; <code>deepseek_sessions</code> / <code>deepseek_result</code> / <code>deepseek_steer</code> / <code>deepseek_cancel</code><br><br>
+Long jobs: pass <code>background: true</code> and read the report later with <code>deepseek_result</code>.
 The server starts on demand. To stop it fully, end the node process holding port ${ctx.webServer.port}.</div>
 
 <script>
@@ -590,9 +884,13 @@ document.querySelectorAll('input[data-model]').forEach(box => {
       // Stateless transports throw if reused, so both server and transport are
       // built per request.
       const server = buildServer();
+      // SSE, not a buffered JSON body: the response starts streaming at once
+      // (progress notifications, keep-alives) instead of sending nothing until
+      // the tool finishes, which is what let client-side header timeouts cut
+      // long delegations at 300s.
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
-        enableJsonResponse: true,
+        enableJsonResponse: false,
       });
       const close = () => {
         transport.close().catch(() => {});

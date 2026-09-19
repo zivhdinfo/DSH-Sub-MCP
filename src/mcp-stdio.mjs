@@ -4,6 +4,7 @@
 //
 // Registered with:  claude mcp add deepseek -- node <abs>/src/mcp-stdio.mjs
 import { spawn } from 'node:child_process';
+import { request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
 import { readFileSync, existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -85,25 +86,95 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + '\n');
 }
 
-async function forward(request) {
+// Minimal SSE reader: yields the JSON payload of every `data:` event. The
+// harness streams progress notifications this way while a tool call runs.
+function readSse(res, onEvent) {
+  let buffer = '';
+  res.setEncoding('utf8');
+  res.on('data', chunk => {
+    buffer += chunk;
+    let cut;
+    while ((cut = buffer.indexOf('\n\n')) >= 0) {
+      const block = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      const data = block
+        .split('\n')
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).trimStart())
+        .join('\n');
+      if (!data) continue; // comments / keep-alives
+      try { onEvent(JSON.parse(data)); } catch { log(`unparseable SSE event: ${data.slice(0, 200)}`); }
+    }
+  });
+}
+
+// Plain node:http, deliberately NOT fetch(): the fetch client caps the wait for
+// response headers at 300s (undici default), which silently aborted every
+// delegation longer than five minutes. A tool call here legitimately runs for
+// many minutes, and the harness enforces its own timeoutSec, so the bridge
+// imposes no time limit of its own.
+async function forward(request, { signal, onNotification } = {}) {
   await ensureHarness();
   const token = readToken();
   if (!token) throw new Error('mcp-token.txt not found — run `npm start` once to initialise');
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      accept: 'application/json, text/event-stream',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify(request),
+  const body = JSON.stringify(request);
+
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(endpoint, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/json, text/event-stream',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    }, res => {
+      const type = String(res.headers['content-type'] ?? '');
+      if (res.statusCode === 202) { res.resume(); resolve(null); return; }
+      if (res.statusCode !== 200) {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', c => { text = (text + c).slice(0, 300); });
+        res.on('end', () => reject(new Error(`harness returned HTTP ${res.statusCode}: ${text}`)));
+        return;
+      }
+      if (type.startsWith('text/event-stream')) {
+        let answered = false;
+        readSse(res, event => {
+          if (event && typeof event === 'object' && event.id !== undefined && ('result' in event || 'error' in event)) {
+            answered = true;
+            resolve(event);
+          } else {
+            onNotification?.(event);
+          }
+        });
+        res.on('end', () => { if (!answered) reject(new Error('harness closed the stream without answering')); });
+        res.on('error', reject);
+        return;
+      }
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', c => { text += c; });
+      res.on('end', () => {
+        try { resolve(text ? JSON.parse(text) : null); } catch (error) { reject(error); }
+      });
+      res.on('error', reject);
+    });
+    req.setTimeout(0);
+    req.on('error', reject);
+    if (signal) {
+      const abort = () => req.destroy(new Error('cancelled by the parent'));
+      if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+    }
+    req.end(body);
   });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`harness returned HTTP ${response.status}: ${text.slice(0, 300)}`);
-  return text ? JSON.parse(text) : null;
 }
 
 const inFlight = new Set();
+// Request id → controller, so a `notifications/cancelled` from the parent (Esc,
+// or its own timeout) closes that HTTP request; the harness sees the socket
+// drop and stops the foreground delegation instead of burning tokens unheard.
+const cancellers = new Map();
 
 async function handle(line) {
   let request;
@@ -112,8 +183,21 @@ async function handle(line) {
   } catch {
     return; // Not our business to answer unparseable frames.
   }
+  if (request.method === 'notifications/cancelled') {
+    const id = request.params?.requestId;
+    const controller = cancellers.get(id);
+    if (controller) { controller.abort(); log(`cancelled request ${id}`); }
+    return; // The harness is stateless per request; only the socket matters.
+  }
+  const controller = new AbortController();
+  controller.method = request.method;
+  if (request.id !== undefined) cancellers.set(request.id, controller);
   try {
-    const reply = await forward(request);
+    const reply = await forward(request, {
+      signal: controller.signal,
+      // Progress and other notifications belong to the parent, unchanged.
+      onNotification: notification => { if (notification?.method) send(notification); },
+    });
     // Notifications carry no id and expect no response.
     if (reply && request.id !== undefined) send(reply);
   } catch (error) {
@@ -121,11 +205,14 @@ async function handle(line) {
       log(String(error.message || error));
       return;
     }
+    if (controller.signal.aborted) return; // The parent already gave up on this id.
     send({
       jsonrpc: '2.0',
       id: request.id,
       error: { code: -32000, message: String(error.message || error) },
     });
+  } finally {
+    if (request.id !== undefined) cancellers.delete(request.id);
   }
 }
 
@@ -136,9 +223,14 @@ rl.on('line', line => {
   inFlight.add(task);
 });
 
-// Exiting the moment stdin closes would abandon replies that are still waiting on
-// a harness that is only just booting.
+// The parent is gone once stdin closes. Quick replies (initialize, tools/list)
+// still get answered in case it is only draining; foreground tool calls are cut
+// so the harness stops those agents instead of working for nobody. Background
+// delegations live in the harness and are unaffected.
 rl.on('close', async () => {
+  for (const controller of cancellers.values()) {
+    if (controller.method === 'tools/call') controller.abort();
+  }
   await Promise.allSettled([...inFlight]);
   process.exit(0);
 });

@@ -38,7 +38,7 @@ Everything else happens in the control panel:
 | 1. API key | Shows whether a key is configured; if not, links to the DSH UI → Settings → Models |
 | 2. Connect a parent agent | **Buttons** that run `claude mcp add` / `codex mcp add` for you over **stdio** (auto-start) and install **usage guidance**: a global skill for Claude Code, a fenced section in Codex's `AGENTS.md`. Locates the CLI binaries automatically; safe to click again |
 | 3. Allowed models | **Checkboxes** to enable/disable each model; a disabled model is refused if requested |
-| 4. Recent delegations | Every run with model, status, duration, tokens in/out, **cache-hit ratio** and changed files |
+| 4. Recent delegations | Every run with model, status, **why it stopped / what it is doing now**, duration, tokens in/out, **cache-hit ratio** and changed files; hover a row for the task and session id |
 
 The control panel is also reachable from a floating link inside the DSH UI.
 
@@ -46,13 +46,13 @@ The control panel is also reachable from a floating link inside the DSH UI.
 
 Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[deepseek research] …` or `[deepseek code] …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically.
 
-**Stopping a run:** open the session and press **Stop** in the composer. It calls the same `agent.cancel` the harness uses for its own sessions, which aborts the turn and kills any command the agent is running (verified: a `Start-Sleep 120` was killed at cancel time and the tool returned `stopReason: aborted`). The MCP call returns immediately with the changed-file evidence.
+**Stopping a run:** from the parent, `deepseek_cancel` (or Esc on a foreground call); from the DSH UI, open the session and press **Stop** in the composer. Both call the same `agent.cancel` the harness uses for its own sessions, which aborts the turn and kills any command the agent is running (verified: a `Start-Sleep 120` was killed at cancel time and the tool returned `stopReason: aborted`). The MCP result carries the changed-file evidence and the reason. A stopped session is not dead: `deepseek_continue` resumes it with its memory intact.
 
 ### Teaching the parent how to delegate
 
 Registering the server only makes the tools exist. The connect buttons also install guidance on *when and how* to use them:
 
-- **Claude Code:** `skills/claude/deepseek-subagent/SKILL.md` is copied to `~/.claude/skills/deepseek-subagent/` (respects `CLAUDE_CONFIG_DIR`). Its `allowed-tools` pre-approves the three MCP tools so there are no permission prompts.
+- **Claude Code:** `skills/claude/deepseek-subagent/SKILL.md` is copied to `~/.claude/skills/deepseek-subagent/` (respects `CLAUDE_CONFIG_DIR`). Its `allowed-tools` pre-approves all the MCP tools so there are no permission prompts.
 - **Codex CLI:** `skills/codex/AGENTS.snippet.md` is inserted into `~/.codex/AGENTS.md` between `<!-- dsh-sub-mcp:start/end -->` markers (respects `CODEX_HOME`). Re-connecting replaces the section; your own content around it is untouched.
 
 Edit the files under `skills/` and click connect again to redeploy them.
@@ -87,24 +87,53 @@ After connecting once, **you never start anything by hand again**: launching Cla
 2. Ask naturally:
    - *"use deepseek to review the auth module for bugs"* → `deepseek_research`
    - *"use deepseek to fix the off-by-one in math.js"* → `deepseek_code`
+   - *"ask deepseek to carry on where it stopped"* → `deepseek_continue`
+   - *"what is deepseek doing?"* → `deepseek_sessions`
 3. Nothing to shut down. To stop the server completely, end the node process holding port 3083.
 
-## The three MCP tools
+## The MCP tools
+
+### Delegating
 
 | Tool | Tools available to the agent | Use for |
 |---|---|---|
 | `deepseek_models(refresh?)` | — | Current DeepSeek models, fetched live from the API |
-| `deepseek_research(task, workspace, model?, timeoutSec?)` | `read, read_image, glob, grep` | Analysis, review, exploration — **never writes** |
-| `deepseek_code(task, workspace, model?, timeoutSec?, allowDirty?)` | plus `write, edit, bash, pwsh` | Actual code changes |
+| `deepseek_research(task, workspace, …)` | `read, read_image, glob, grep` | Analysis, review, exploration — **never writes** |
+| `deepseek_code(task, workspace, allowDirty?, …)` | plus `write, edit, bash, pwsh` | Actual code changes |
+
+Shared options: `model?`, `timeoutSec?` (default 900, max 3600), `maxToolCalls?` (default 150, 20–400), `background?`.
 
 - `workspace` is **required** and absolute. Claude/Codex fills in its own cwd.
 - `task` must be **self-contained** — the DeepSeek agent cannot see the parent's conversation.
 - `deepseek_code` **refuses a dirty git tree** (unless `allowDirty: true`) so a rollback point always exists.
-- Every result, including failures, carries `stopReason` and the list of changed files.
+- Every result, including failures, carries `stopReason`, the **session id**, and the list of changed files.
+- `background: true` returns at once with the session id; the agent keeps working and the report is read later with `deepseek_result`.
+
+### Sessions: list, read, continue, steer, cancel
+
+Every delegation is a persisted DSH session, and the parent can keep working with it:
+
+| Tool | What it does |
+|---|---|
+| `deepseek_sessions(workspace?, status?, limit?)` | Running sessions first (elapsed, tool calls so far, last tool), then finished ones newest first with status, **why they stopped**, duration, cost and changed-file count. |
+| `deepseek_result(sessionId, waitSec?)` | The full report of a session — after a background run, after the parent's own timeout, or to re-read an old one. For a running session it waits up to `waitSec`, then reports progress instead. |
+| `deepseek_continue(sessionId, message, role?, …)` | Sends a **follow-up turn to a finished session**. The agent resumes with everything it already read and did — "carry on where you stopped", "now also handle X", or a follow-up question to a research agent. `role` can switch capability for that turn; `allowDirty` defaults to true because the tree is usually dirty from the previous turn. |
+| `deepseek_steer(sessionId, message)` | Injects a message into a **running** session; the agent reads it at its next step. |
+| `deepseek_cancel(sessionId)` | Stops a running session. Files already written stay; the record says it was cancelled and it can be continued later. |
+
+Reports live in `.dsh-sub/results/<sessionId>.json`; the run list in `.dsh-sub/delegations.json` (a run is recorded when it starts, so a harness crash leaves it marked `interrupted`, not lost).
 
 ### Guardrails
 
-The workspace is rejected if it is a drive root, the user profile, or contains the harness's own `.dsh-sub` credential store. The sub-agent is forbidden from deploying, pushing, using SSH, reading secrets, or spawning nested agents, and a `LoopGuard` aborts runaway loops (default: 80 tool calls, 3 identical repeats).
+The workspace is rejected if it is a drive root, the user profile, or contains the harness's own `.dsh-sub` credential store. The sub-agent is forbidden from deploying, pushing, using SSH, reading secrets, or spawning nested agents.
+
+The **loop guard** is cooperative rather than a kill switch:
+
+- **Budget** — default 150 tool calls (`maxToolCalls`). The agent is told its budget up front, warned at 80%, and once it is spent every further call is *blocked with a message* telling it to write its final report. Only an agent that keeps calling tools after that is stopped.
+- **Repeats** — the same call three times within the last 12 calls **with no file edit in between** is blocked (its result cannot change). Edit → typecheck → edit → typecheck is fine.
+- After three blocked calls the run is stopped, and the record says why (`tool-call-limit` / `repeat-loop`).
+
+Every early stop carries its reason in the result, the sessions list and the control panel: timeout, loop guard, `deepseek_cancel`, or the parent disconnecting.
 
 ## Auto-start
 
@@ -137,15 +166,13 @@ The DSH adapter ships a hardcoded catalog that still lists retired models, so th
 
 ## Long-running jobs
 
-Tools run **synchronously** with a default 900s timeout (`timeoutSec`, max 3600).
+A foreground call runs for as long as the agent needs, up to `timeoutSec` (default 900, max 3600). While it runs the bridge streams **progress notifications** to the parent (elapsed time, tool calls, the current tool), which Claude Code shows live and which keep its idle timer from firing.
 
-Claude Code auto-backgrounds calls over 2 minutes. For long jobs, set the per-server timeout in `.claude.json` **above** `timeoutSec`:
+For anything that may take more than a few minutes, prefer `background: true` and collect the report with `deepseek_result({ sessionId, waitSec })`: the parent is free to do other work meanwhile, and nothing is lost if the parent's own timeout fires.
 
-```json
-{ "mcpServers": { "deepseek": { "timeout": 1200000 } } }
-```
+Cancelling (Esc) in the parent aborts the DeepSeek agent — the bridge turns the parent's `notifications/cancelled` into a dropped connection, and the harness stops that run. Files already written are **not** rolled back — which is why `deepseek_code` insists on a clean tree — and the session can be resumed with `deepseek_continue`.
 
-Cancelling (Esc) aborts the DeepSeek agent. Files already written are **not** rolled back — which is why `deepseek_code` insists on a clean tree.
+> **Why the bridge does not use `fetch()`.** Node's built-in fetch caps the wait for response headers at 300 s, and with a buffered JSON response nothing is sent until the tool finishes. Every delegation longer than five minutes was silently aborted at ~305 s. The bridge now uses `node:http` with no timeout and the harness streams SSE, so the only limits are `timeoutSec` and the parent's own settings (Claude Code: `MCP_TOOL_TIMEOUT`, and a 30-minute stdio idle timeout that progress notifications reset).
 
 ## Layout
 
@@ -153,8 +180,8 @@ Cancelling (Esc) aborts the DeepSeek agent. Files already written are **not** ro
 src/bootstrap.mjs    scaffolds the DSH profile and generates .dsh-sub/sub.patch.json (absolute paths)
 src/serve.mjs        runs the harness (foreground, or background with --no-open)
 src/mcp-stdio.mjs    stdio bridge for Claude/Codex; auto-starts the harness
-src/mcp-plugin.mjs   DSH plugin: /mcp endpoint, /setup control panel, the three tools
-src/delegate.mjs     runs each DeepSeek delegation as a top-level harness session, with LoopGuard
+src/mcp-plugin.mjs   DSH plugin: /mcp endpoint, /setup control panel, the eight tools, run history and results
+src/delegate.mjs     runs each DeepSeek delegation as a top-level harness session (create or resume), with the loop guard
 src/models.mjs       live /models probe, cache, retirement detection, enable/disable
 src/workspace.mjs    workspace validation and git evidence
 .dsh-sub/            private DSH_HOME: profile, credentials, cache, token, logs (git-ignored)
