@@ -168,7 +168,7 @@ export class Catalog {
     try { apiKey = await resolveKey(); } catch { apiKey = null; }
     if (!apiKey) {
       this.stale = true;
-      this.message = 'No DeepSeek API key configured. Open http://127.0.0.1:3083 → Settings → Models to add one.';
+      this.message = 'No DeepSeek API key configured. Open the DSH UI → Settings → Models to add one.';
       return this.snapshot();
     }
     try {

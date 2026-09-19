@@ -11,8 +11,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const home = path.join(projectRoot, '.dsh-sub');
-const port = 3083;
+const home = process.env.DSH_SUB_HOME ? path.resolve(process.env.DSH_SUB_HOME) : path.join(projectRoot, '.dsh-sub');
+const port = Number(process.env.DSH_SUB_PORT) || 3083;
 const endpoint = `http://127.0.0.1:${port}/mcp`;
 const BOOT_TIMEOUT_MS = 90000;
 

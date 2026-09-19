@@ -42,9 +42,21 @@ Everything else happens in the control panel:
 
 The control panel is also reachable from a floating link inside the DSH UI.
 
-### Why the DSH session list looks empty
+### Every run is a session in the DSH UI
 
-Sub-agent runs are real harness sessions (persisted under `.dsh-sub/sessions/<workspace>/`), but they are not *web* sessions, and the DSH sidebar lists sessions for the workspace you have selected there. Add your repo as a workspace in the sidebar to browse them, or just use section 4 of the control panel, which is built for exactly this.
+Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[deepseek research] …` or `[deepseek code] …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically.
+
+This is deliberate. The harness's own subagent mechanism tags children with `origin: "subagent"`, and the DSH sidebar hides those unconditionally (they only render nested under a parent web session). So instead of `ctx.subagents.start`, `src/delegate.mjs` does what the in-process subagent driver does internally — create an agent, apply the persona and tool restriction in its setup window, send one user turn, read the result from the event log — but as a normal session.
+
+### Running a second instance
+
+`DSH_SUB_HOME` and `DSH_SUB_PORT` override the state directory and port, so you can run an isolated instance (for testing, or a second key) beside the live one:
+
+```cmd
+set DSH_SUB_HOME=C:\path\to\other-home
+set DSH_SUB_PORT=3084
+npm start
+```
 
 ### Cost and caching
 
@@ -131,7 +143,7 @@ src/bootstrap.mjs    scaffolds the DSH profile and generates .dsh-sub/sub.patch.
 src/serve.mjs        runs the harness (foreground, or background with --no-open)
 src/mcp-stdio.mjs    stdio bridge for Claude/Codex; auto-starts the harness
 src/mcp-plugin.mjs   DSH plugin: /mcp endpoint, /setup control panel, the three tools
-src/delegate.mjs     runs a DeepSeek sub-agent via ctx.subagents.start('spawn', ...) with LoopGuard
+src/delegate.mjs     runs each DeepSeek delegation as a top-level harness session, with LoopGuard
 src/models.mjs       live /models probe, cache, retirement detection, enable/disable
 src/workspace.mjs    workspace validation and git evidence
 .dsh-sub/            private DSH_HOME: profile, credentials, cache, token, logs (git-ignored)

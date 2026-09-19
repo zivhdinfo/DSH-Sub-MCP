@@ -14,7 +14,7 @@ import { validateWorkspace, gitStatus, diffStatus } from './workspace.mjs';
 import { home, projectRoot } from './bootstrap.mjs';
 
 export const name = 'deepseek-sub-mcp';
-export const inject = ['webServer', 'credentials', 'agents', 'subagents', 'tools', 'connection'];
+export const inject = ['webServer', 'credentials', 'agents', 'tools', 'connection', 'workspaceRegistry', 'sessionTitle'];
 
 const ROUTE = '/mcp';
 const MAX_BODY = 1 << 20;
@@ -157,6 +157,7 @@ export async function apply(ctx) {
         workspace: ws,
         model: picked.model,
         signal,
+        title: `[deepseek ${role}] ${task.replace(/\s+/g, ' ').slice(0, 70)}`,
       });
       const [after, usage] = await Promise.all([gitStatus(ws), readUsage(home, result.sessionId)]);
       const failed = result.stopReason !== 'completed' || !result.text;
@@ -417,7 +418,7 @@ ${runs.length ? `<table><tr><th>When</th><th>Role</th><th>Model</th><th>Status</
 <div class=card>In Claude Code, just ask naturally:<br>
 <em>"use deepseek to review the auth module for bugs"</em> &rarr; <code>deepseek_research</code><br>
 <em>"use deepseek to fix that bug"</em> &rarr; <code>deepseek_code</code><br><br>
-The server starts on demand. To stop it fully, end the node process holding port 3083.</div>
+The server starts on demand. To stop it fully, end the node process holding port ${ctx.webServer.port}.</div>
 
 <script>
 const KEY = new URLSearchParams(location.search).get('key') || '';

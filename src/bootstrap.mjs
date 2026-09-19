@@ -6,9 +6,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readCachedModels } from './models.mjs';
 
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-export const home = path.join(projectRoot, '.dsh-sub');
+// Overridable so a second instance (e.g. for testing) can run beside the live
+// one without sharing state or a port.
+export const home = process.env.DSH_SUB_HOME ? path.resolve(process.env.DSH_SUB_HOME) : path.join(projectRoot, '.dsh-sub');
 export const profileName = 'web';
-export const port = 3083;
+export const port = Number(process.env.DSH_SUB_PORT) || 3083;
 
 const patchFile = path.join(home, 'sub.patch.json');
 const pluginEntry = path.join(projectRoot, 'src', 'mcp-plugin.mjs');
