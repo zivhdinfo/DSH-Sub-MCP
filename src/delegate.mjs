@@ -1,6 +1,44 @@
 // Runs one DeepSeek agent as a DSH subagent. Mirrors the delegation pattern that
 // DSH Team already uses in production (dsh-team/v2-plugin.mjs execute()).
 import { createHash, randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
+// The harness projects every session's token accounting to disk. Reading it
+// back is how we report cost and cache hits without touching the LLM adapter.
+function shapeUsage(totals) {
+  const cacheRead = totals.cacheReadTokens ?? 0;
+  const uncached = totals.uncachedInputTokens ?? 0;
+  const input = cacheRead + uncached;
+  return {
+    inputTokens: input,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: totals.cacheWriteTokens ?? 0,
+    uncachedInputTokens: uncached,
+    outputTokens: totals.outputTokens ?? 0,
+    cacheHitRatio: input ? cacheRead / input : 0,
+  };
+}
+
+// The projection file appears with zeroed totals first and is filled in after
+// the session finalises, so "file exists" is not "accounting done". A run that
+// produced text must have output tokens; wait for that, then give up honestly.
+export async function readUsage(home, sessionId, { waitMs = 6000 } = {}) {
+  const file = path.join(home, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`);
+  const deadline = Date.now() + waitMs;
+  let last = null;
+  do {
+    try {
+      const totals = JSON.parse(await readFile(file, 'utf8'))?.record?.rows?.tokenUsage?.val?.totals;
+      if (totals && typeof totals === 'object') {
+        last = shapeUsage(totals);
+        if (last.outputTokens > 0) return last;
+      }
+    } catch { /* not there yet */ }
+    if (waitMs > 0) await new Promise(r => setTimeout(r, 250));
+  } while (Date.now() < deadline);
+  return last ? { ...last, pending: true } : null;
+}
 
 const READ_TOOLS = ['read', 'read_image', 'glob', 'grep'];
 const WRITE_TOOLS = [...READ_TOOLS, 'write', 'edit', 'bash', 'pwsh'];
@@ -108,7 +146,13 @@ export class Delegator {
           .map(part => part.text)
           .join('\n')
           .trim();
-        return { stopReason: result.stopReason, text, diagnostic: result.diagnostic ?? '', toolCalls: guard.calls };
+        return {
+          stopReason: result.stopReason,
+          text,
+          diagnostic: result.diagnostic ?? '',
+          toolCalls: guard.calls,
+          sessionId: child.id,
+        };
       } finally {
         await child.dispose();
       }

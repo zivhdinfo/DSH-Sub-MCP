@@ -38,8 +38,23 @@ Everything else happens in the control panel:
 | 1. API key | Shows whether a key is configured; if not, links to the DSH UI → Settings → Models |
 | 2. Connect a parent agent | **Buttons** that run `claude mcp add` / `codex mcp add` for you, over **stdio** so the server auto-starts. Locates the CLI binaries automatically; safe to click again |
 | 3. Allowed models | **Checkboxes** to enable/disable each model; a disabled model is refused if requested |
+| 4. Recent delegations | Every run with model, status, duration, tokens in/out, **cache-hit ratio** and changed files |
 
 The control panel is also reachable from a floating link inside the DSH UI.
+
+### Why the DSH session list looks empty
+
+Sub-agent runs are real harness sessions (persisted under `.dsh-sub/sessions/<workspace>/`), but they are not *web* sessions, and the DSH sidebar lists sessions for the workspace you have selected there. Add your repo as a workspace in the sidebar to browse them, or just use section 4 of the control panel, which is built for exactly this.
+
+### Cost and caching
+
+Every tool result ends with a line like:
+
+```
+tokens: 6,653 in (86.6% cache hit, 893 uncached) / 295 out
+```
+
+DeepSeek caches prompt prefixes server-side per account, and cache-hit input is ~50× cheaper than uncached (`deepseek-flash`: $0.003 vs $0.15 per 1M). Parallel sub-agents share the same prefix — the DSH system prompt, tool definitions and this project's task framing — so they benefit from each other, and each agent's own multi-turn loop hits the cache on every turn. The DSH system prompt contains nothing that varies per request (no timestamps), so the prefix stays stable. Accounting is read from the harness's own token meter, not estimated.
 
 After connecting once, **you never start anything by hand again**: launching Claude Code or Codex brings the server up in the background.
 

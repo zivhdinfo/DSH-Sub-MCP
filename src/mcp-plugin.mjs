@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Catalog } from './models.mjs';
-import { Delegator } from './delegate.mjs';
+import { Delegator, readUsage } from './delegate.mjs';
 import { validateWorkspace, gitStatus, diffStatus } from './workspace.mjs';
 import { home, projectRoot } from './bootstrap.mjs';
 
@@ -53,6 +53,52 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
+const fmt = n => Number(n ?? 0).toLocaleString('en-US');
+
+function describeUsage(usage) {
+  if (!usage) return 'tokens: (accounting not available)';
+  if (usage.pending) return 'tokens: accounting still settling — see the control panel for final numbers';
+  const pct = (usage.cacheHitRatio * 100).toFixed(1);
+  return `tokens: ${fmt(usage.inputTokens)} in (${pct}% cache hit, ${fmt(usage.uncachedInputTokens)} uncached) / ${fmt(usage.outputTokens)} out`;
+}
+
+// Append-only record of every delegation, so the control panel can show what
+// ran and what it cost even though these sessions never appear in the DSH
+// session list (they are not web sessions).
+class History {
+  constructor(file, limit = 200) {
+    this.file = file;
+    this.limit = limit;
+    this.entries = [];
+  }
+  async load() {
+    try {
+      const raw = JSON.parse(await readFile(this.file, 'utf8'));
+      if (Array.isArray(raw)) this.entries = raw.slice(-this.limit);
+    } catch { /* first run */ }
+  }
+  async add(entry) {
+    this.entries.push(entry);
+    if (this.entries.length > this.limit) this.entries.splice(0, this.entries.length - this.limit);
+    await this.persist();
+  }
+  async persist() {
+    await writeFile(this.file, JSON.stringify(this.entries, null, 2), { mode: 0o600 }).catch(() => {});
+  }
+  // Accounting that was still settling when the run returned gets picked up
+  // the next time anyone looks, so the panel converges to the real numbers.
+  async settle(home) {
+    let changed = false;
+    for (const entry of this.entries) {
+      if (!entry.usage?.pending || !entry.sessionId) continue;
+      const usage = await readUsage(home, entry.sessionId, { waitMs: 0 });
+      if (usage && !usage.pending) { entry.usage = usage; changed = true; }
+    }
+    if (changed) await this.persist();
+  }
+  recent(n = 30) { return this.entries.slice(-n).reverse(); }
+}
+
 function describeChanges(before, after) {
   if (!after) return 'Workspace is not a git repo — no file-change evidence available.';
   const changed = diffStatus(before, after);
@@ -65,9 +111,11 @@ export async function apply(ctx) {
   const token = await ensureToken();
   const catalog = new Catalog(home);
   const delegator = new Delegator(ctx);
+  const history = new History(path.join(home, 'delegations.json'));
   const resolveKey = async () => (await ctx.credentials.resolve('DEEPSEEK_API_KEY'))?.value ?? null;
 
   await catalog.load();
+  await history.load();
   // Warm the catalog from the live API without blocking boot.
   catalog.refresh(resolveKey).catch(() => {});
 
@@ -93,6 +141,15 @@ export async function apply(ctx) {
     const header = [`model: ${picked.model}`, `role: ${role}`, `workspace: ${ws}`];
     if (picked.warning) header.push(`WARNING: ${picked.warning}`);
 
+    const startedAt = Date.now();
+    const record = {
+      time: new Date(startedAt).toISOString(),
+      role,
+      model: picked.model,
+      workspace: ws,
+      task: task.slice(0, 160),
+    };
+
     try {
       const result = await delegator.run({
         role,
@@ -101,11 +158,22 @@ export async function apply(ctx) {
         model: picked.model,
         signal,
       });
-      const after = await gitStatus(ws);
+      const [after, usage] = await Promise.all([gitStatus(ws), readUsage(home, result.sessionId)]);
       const failed = result.stopReason !== 'completed' || !result.text;
+      const changed = diffStatus(before, after);
+      await history.add({
+        ...record,
+        status: failed ? result.stopReason : 'completed',
+        durationMs: Date.now() - startedAt,
+        toolCalls: result.toolCalls,
+        changedFiles: changed?.length ?? null,
+        usage,
+        sessionId: result.sessionId,
+      });
       const body = [
         header.join(' | '),
-        `stopReason: ${result.stopReason} | tool calls: ${result.toolCalls}`,
+        `stopReason: ${result.stopReason} | tool calls: ${result.toolCalls} | ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+        describeUsage(usage),
         ...(result.diagnostic ? [`diagnostic: ${result.diagnostic}`] : []),
         ...(failed && !result.diagnostic
           ? ['hint: check the DeepSeek API key in the GUI (Settings → Models) and your account quota.']
@@ -119,6 +187,13 @@ export async function apply(ctx) {
       // Report the damage even on failure: an aborted write-mode agent can leave
       // partial edits, and the parent needs to see them to recover.
       const after = await gitStatus(ws).catch(() => null);
+      await history.add({
+        ...record,
+        status: 'failed',
+        durationMs: Date.now() - startedAt,
+        error: String(error.message || error).slice(0, 300),
+        changedFiles: diffStatus(before, after)?.length ?? null,
+      });
       const body = [
         header.join(' | '),
         `FAILED: ${String(error.message || error)}`,
@@ -267,7 +342,20 @@ export async function apply(ctx) {
     return { ...result, exe };
   }
 
-  function setupPage({ keyConfigured, snapshot, found }) {
+  function setupPage({ keyConfigured, snapshot, found, runs, totalRuns }) {
+    const runRow = r => {
+      const u = r.usage;
+      const when = new Date(r.time).toLocaleTimeString('en-GB', { hour12: false });
+      const status = r.status === 'completed'
+        ? '<span class=ok>completed</span>'
+        : `<span class=bad title="${escape(r.error ?? '')}">${escape(r.status)}</span>`;
+      return `<tr title="${escape(r.task)}">
+<td>${escape(when)}</td><td>${escape(r.role)}</td><td><code>${escape(r.model)}</code></td><td>${status}</td>
+<td>${(r.durationMs / 1000).toFixed(0)}s</td>
+<td>${u ? `${fmt(u.inputTokens)} / ${fmt(u.outputTokens)}` : '—'}</td>
+<td>${u ? `<span class=${u.cacheHitRatio >= 0.5 ? 'ok' : 'warn'}>${(u.cacheHitRatio * 100).toFixed(0)}%</span>` : '—'}</td>
+<td>${r.changedFiles ?? '—'}</td></tr>`;
+    };
     const row = m => `<tr>
 <td><label><input type=checkbox data-model="${escape(m.model)}" ${m.enabled === false ? '' : 'checked'}
  ${m.listed ? '' : 'disabled'}> <code>${escape(m.model)}</code></label></td>
@@ -316,6 +404,13 @@ Click again at any time to replace an existing registration.</p>
 ${snapshot.catalogStale ? 'not yet verified against the API' : 'synced at ' + escape(snapshot.catalogCheckedAt)}
 ${snapshot.message ? '<br>' + escape(snapshot.message) : ''}<br>
 A disabled model is refused if Claude/Codex requests it.</p>
+</div>
+
+<h2>4. Recent delegations</h2>
+<div class=card>
+${runs.length ? `<table><tr><th>When</th><th>Role</th><th>Model</th><th>Status</th><th>Time</th><th>Tokens in / out</th><th>Cache hit</th><th>Files</th></tr>${runs.map(runRow).join('')}</table>
+<p class=muted style="margin-bottom:0">${escape(runs.length)} most recent, of ${escape(totalRuns)} recorded. Sessions live under <code>.dsh-sub/sessions/</code>; add the workspace in the DSH sidebar to browse them there.</p>`
+  : '<span class=muted>No delegations yet. They will appear here as Claude/Codex calls the tools.</span>'}
 </div>
 
 <h2>How to use</h2>
@@ -397,10 +492,17 @@ document.querySelectorAll('input[data-model]').forEach(box => {
         return json(404, { error: 'not found' });
       }
 
+      await history.settle(home);
       const keyConfigured = await resolveKey().then(Boolean).catch(() => false);
       const snapshot = keyConfigured ? await catalog.refresh(resolveKey) : catalog.snapshot();
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(setupPage({ keyConfigured, snapshot, found: { claude: cliCandidates("claude")[0] ?? null, codex: cliCandidates("codex")[0] ?? null } }));
+      res.end(setupPage({
+        keyConfigured,
+        snapshot,
+        found: { claude: cliCandidates("claude")[0] ?? null, codex: cliCandidates("codex")[0] ?? null },
+        runs: history.recent(30),
+        totalRuns: history.entries.length,
+      }));
     },
   });
 
