@@ -12,7 +12,11 @@ import { ModelDirectory, AskFirstError, splitKey, keyOf, DEEPSEEK } from './mode
 import { DeepSeekLive } from './deepseek-live.mjs';
 import { scanSkills, summarizeSkills, resolveSkills, skillRootsSummary } from './skills.mjs';
 import { Delegator, readUsage, usageDelta, TOOL_CALL_BOUNDS, DEFAULT_LIMITS } from './delegate.mjs';
-import { validateWorkspace, gitStatus, diffStatus } from './workspace.mjs';
+import {
+  validateWorkspace, gitStatus, diffStatus, samePath,
+  createWorktree, linkDirs, copyWorktreeInclude, carryUncommitted, lockWorktree, unlockWorktree,
+  worktreeExists, worktreeState, worktreeDiff, commitWorktree, applyWorktree, removeWorktree, rewritePaths, snapshotTree,
+} from './workspace.mjs';
 import { home, projectRoot } from './bootstrap.mjs';
 
 export const name = 'deepseek-sub-mcp';
@@ -122,6 +126,17 @@ class History {
     }
     return undefined;
   }
+  // Every turn of a worktree session carries the same worktree record, so a
+  // removal is stamped on all of them.
+  async markWorktreeRemoved(sessionId) {
+    let changed = false;
+    for (const entry of this.entries) {
+      if (entry.sessionId !== sessionId || !entry.worktree || entry.worktree.removed) continue;
+      entry.worktree = { ...entry.worktree, removed: true };
+      changed = true;
+    }
+    if (changed) await this.persist();
+  }
   // Accounting that was still settling when the run returned gets picked up
   // the next time anyone looks, so the panel converges to the real numbers.
   async settle(home) {
@@ -171,16 +186,48 @@ function describeChanges(before, after) {
   return `Files changed (${changed.length}):\n` + changed.map(c => `  ${c.status || '??'} ${c.path}`).join('\n');
 }
 
-const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
-
 // Sidebar title: "[Code] - store-main: fix the nav overflow…". The mode and the
 // project folder come first so a list of sessions scans by eye; the harness
-// caps titles at 80 bytes, so the task excerpt is short.
+// caps titles at 80 bytes, so the task excerpt is short. A worktree session
+// carries the branch glyph so it reads as "not the main checkout".
 const MODE_LABEL = { code: 'Code', research: 'Research' };
-function sessionTitleFor(role, workspace, task) {
+function sessionTitleFor(role, workspace, task, worktree = null) {
   const folder = path.basename(workspace) || workspace;
   const excerpt = task.replace(/\s+/g, ' ').trim().slice(0, 60);
-  return `[${MODE_LABEL[role] ?? role}] - ${folder}: ${excerpt}`;
+  return `[${MODE_LABEL[role] ?? role}${worktree ? ' ⎇' : ''}] - ${folder}: ${excerpt}`;
+}
+
+// What a history record / result keeps about a worktree: enough to resume in
+// it, inspect it and remove it later, nothing transient.
+function worktreeRecord(wt) {
+  if (!wt) return undefined;
+  return {
+    repo: wt.repo, path: wt.path, cwd: wt.cwd, branch: wt.branch, base: wt.base, start: wt.start ?? wt.base,
+    links: wt.links ?? [], ...(wt.removed ? { removed: true } : {}),
+  };
+}
+
+// The block a worktree run ends with: where the work is and the three ways to
+// deal with it. The agent cannot commit in the worktree (its sandbox root
+// excludes the shared .git), so the parent is told to take or drop the work.
+function describeWorktree(wt, state, sessionId) {
+  if (wt.removed) return ['worktree: removed automatically — the agent made no changes.'];
+  const summary = state
+    ? `${state.status.length} changed entr${state.status.length === 1 ? 'y' : 'ies'}, ${state.commits} commit${state.commits === 1 ? '' : 's'} on top of ${wt.base.slice(0, 7)}`
+    : 'state unknown';
+  return [
+    `worktree: ${wt.path} | branch: ${wt.branch} | base: ${wt.base.slice(0, 7)} — ${summary}`,
+    'The changes are in the worktree, NOT in your checkout. The worktree stays until you remove it:',
+    `  review → deepseek_worktree({ sessionId: "${sessionId}", action: "diff" })  or  git -C "${wt.path}" diff ${wt.base.slice(0, 7)}`,
+    `  take   → deepseek_worktree({ sessionId: "${sessionId}", action: "commit", message: "…" }) then git merge ${wt.branch}   |  or action: "apply" to copy them into your working tree uncommitted`,
+    `  drop   → deepseek_worktree({ sessionId: "${sessionId}", action: "remove" })`,
+  ];
+}
+
+// The parent-facing view of a worktree record.
+function worktreeSummary(wt) {
+  if (!wt) return null;
+  return { path: wt.path, branch: wt.branch, base: wt.base?.slice(0, 7) ?? null, removed: wt.removed === true };
 }
 
 function requireSessionId(value) {
@@ -214,13 +261,48 @@ export async function apply(ctx) {
   // it, so their runs sit under "Ungrouped" in the sidebar. Adopt them once
   // the harness is up; attaching is idempotent.
   setTimeout(() => delegator.adoptSessions(history.sessionWorkspaces()).catch(() => {}), 3000).unref?.();
+  // A worktree removed outside this server (or before forgetWorkspace could
+  // find the record) leaves a sidebar workspace pointing at nothing; drop those.
+  setTimeout(async () => {
+    const seen = new Set();
+    for (const e of history.entries) {
+      const wt = e.worktree;
+      if (!wt || seen.has(wt.path)) continue;
+      seen.add(wt.path);
+      if (wt.removed || !(await worktreeExists(wt))) {
+        if (!wt.removed) await history.markWorktreeRemoved(e.sessionId).catch(() => {});
+        await delegator.forgetWorkspace(wt.path).catch(() => {});
+      }
+    }
+  }, 4000).unref?.();
 
   const text = (body, isError = false) => ({ content: [{ type: 'text', text: body }], isError });
   const json = value => text(JSON.stringify(value, null, 2));
 
+  // End of a worktree turn: release the lock and, like Claude Code's subagent
+  // worktrees, drop the worktree when the agent changed nothing. One with work
+  // in it stays until the parent takes or removes it. Mutates `wt.removed`.
+  async function settleWorktree(wt, sessionId) {
+    if (!wt) return [];
+    await unlockWorktree(wt).catch(() => {});
+    let state = null;
+    try { state = await worktreeState(wt); } catch { /* reported as unknown */ }
+    if (state?.clean) {
+      try {
+        await removeWorktree(wt, {});
+        await delegator.forgetWorkspace(wt.path);
+        await history.markWorktreeRemoved(sessionId);
+        wt.removed = true;
+      } catch (error) {
+        return [`worktree: ${wt.path} has no changes but could not be removed (${String(error.message || error)}); deepseek_worktree remove retries it.`];
+      }
+    }
+    return describeWorktree(wt, state, sessionId);
+  }
+
   // One delegation turn: a fresh session, or a follow-up turn on a persisted
   // one (`resume` is that session's latest history entry).
-  async function startRun({ role, task, workspace, model, reasoningEffort, skills, timeoutSec, allowDirty, background, maxToolCalls, resume }, extra) {
+  async function startRun({ role, task, workspace, model, reasoningEffort, skills, timeoutSec, allowDirty, background, maxToolCalls, resume, isolation, branch, base, linkDirs: links, includeUncommitted }, extra) {
     if (typeof task !== 'string' || !task.trim()) throw new Error('task must not be empty.');
     if (task.length > 32000) throw new Error('task is limited to 32,000 characters.');
     // Model first: the ask-first refusal must fire before anything is touched
@@ -246,11 +328,47 @@ export async function apply(ctx) {
     // or went away). A background run answers only to timeoutSec and deepseek_cancel.
     const client = background ? undefined : extra?.signal;
 
-    const before = await gitStatus(ws, timeout);
-    if (role === 'code' && allowDirty !== true && before && before.length) {
+    // Worktree isolation: the agent's cwd becomes a fresh checkout of the repo
+    // on its own branch. A continuation stays in its session's worktree (the
+    // session cwd is immutable anyway); a fresh run builds one on request.
+    // The sandbox confines the agent's writes to that cwd, so the parent's
+    // checkout — dirty or not — is out of its reach, which is why the dirty
+    // check below does not apply.
+    let worktree = resume?.worktree ?? null;
+    let cwd = ws;
+    if (worktree) {
+      if (worktree.removed || !(await worktreeExists(worktree))) {
+        throw new Error(`The worktree of session ${resume.sessionId} (${worktree.path}) no longer exists. Start a new delegation instead.`);
+      }
+      cwd = worktree.cwd;
+      await lockWorktree(worktree, 'DSH-Sub-MCP delegation in progress', timeout);
+    } else if (isolation === 'worktree') {
+      if (role !== 'code') throw new Error('isolation: "worktree" only applies to deepseek_code; a research agent never writes.');
+      worktree = await createWorktree({ workspace: ws, task, branch, base: base || 'HEAD', signal: timeout });
+      try {
+        await linkDirs(worktree, links ?? ['node_modules'], timeout);
+        await copyWorktreeInclude(worktree, timeout);
+        if (includeUncommitted === true) worktree.carried = await carryUncommitted(worktree, timeout);
+        // What the agent starts from; its own change is measured against this.
+        worktree.start = await snapshotTree(worktree, timeout);
+      } catch (error) {
+        await removeWorktree(worktree, { signal: timeout }).catch(() => {});
+        throw error;
+      }
+      cwd = worktree.cwd;
+    } else if (isolation !== undefined && isolation !== 'inplace') {
+      throw new Error('isolation must be "inplace" or "worktree".');
+    }
+    // The parent writes the task against its own checkout; in the worktree the
+    // same files live under the worktree path.
+    const agentTask = worktree ? rewritePaths(task, worktree.repo, worktree.path) : task;
+
+    const before = await gitStatus(cwd, timeout);
+    if (role === 'code' && !worktree && allowDirty !== true && before && before.length) {
       throw new Error(
         `Workspace has ${before.length} uncommitted changes. `
-        + 'Commit or stash first so there is always a rollback point, or call again with allowDirty: true.',
+        + 'Commit or stash first so there is always a rollback point, call again with allowDirty: true, '
+        + 'or pass isolation: "worktree" to run in a separate checkout and leave this tree untouched.',
       );
     }
 
@@ -258,6 +376,7 @@ export async function apply(ctx) {
     const turn = resume ? (resume.turn ?? 1) + 1 : 1;
     const skillNames = attached.map(s => s.name);
     const header = [`model: ${picked.key}`, `effort: ${chosen.effort ?? 'n/a'}`, `role: ${role}`, `workspace: ${ws}`, `session: ${sessionId}${turn > 1 ? ` (turn ${turn})` : ''}`];
+    if (worktree) header.push(`worktree: ${worktree.path}`, `branch: ${worktree.branch}`);
     if (skillNames.length) header.push(`skills: ${skillNames.join(', ')}`);
     for (const w of [picked.warning, chosen.warning]) if (w) header.push(`WARNING: ${w}`);
 
@@ -274,6 +393,7 @@ export async function apply(ctx) {
       turn,
       background: Boolean(background),
       ...(skillNames.length ? { skills: skillNames } : {}),
+      ...(worktree ? { worktree: worktreeRecord(worktree) } : {}),
     });
     const usageBefore = resume ? await readUsage(home, sessionId, { waitMs: 0 }) : null;
 
@@ -296,14 +416,16 @@ export async function apply(ctx) {
       try {
         const result = await delegator.run({
           role,
-          task,
-          workspace: ws,
+          task: agentTask,
+          workspace: cwd,
+          worktree,
+          workspaceTitle: worktree ? `${path.basename(worktree.repo)} ⎇ ${worktree.branch}` : undefined,
           provider: picked.provider,
           model: picked.model,
           reasoningEffort: chosen.effort ?? undefined,
           skills: attached,
           signals: { timeout, 'client-disconnect': client },
-          title: sessionTitleFor(role, ws, task),
+          title: sessionTitleFor(role, ws, task, worktree),
           maxToolCalls: budget,
           sessionId,
           resumeSessionId: resume ? sessionId : undefined,
@@ -314,12 +436,13 @@ export async function apply(ctx) {
             ticker = setInterval(() => report(run, true), PROGRESS_INTERVAL_MS);
           },
         });
-        const [after, usageTotal] = await Promise.all([gitStatus(ws), readUsage(home, sessionId, { after: usageBefore })]);
+        const [after, usageTotal] = await Promise.all([gitStatus(cwd), readUsage(home, sessionId, { after: usageBefore })]);
         const usage = resume ? usageDelta(usageTotal, usageBefore) : usageTotal;
         const failed = result.stopReason !== 'completed' || !result.text;
         const changed = diffStatus(before, after);
         const durationMs = Date.now() - startedAt;
         const status = failed ? result.stopReason : 'completed';
+        const worktreeLines = await settleWorktree(worktree, sessionId);
         // A turn run on the agent the DSH UI holds uses that agent's model.
         const usedModel = result.model ?? picked.key;
         header[0] = `model: ${usedModel}`;
@@ -333,6 +456,7 @@ export async function apply(ctx) {
             : []),
           ...(failed ? [`To pick up where it stopped: deepseek_continue({ sessionId: "${sessionId}", message: "..." })`] : []),
           describeChanges(before, after),
+          ...worktreeLines,
           '',
           result.text || '(agent returned no text content)',
         ].join('\n');
@@ -345,10 +469,11 @@ export async function apply(ctx) {
           toolCalls: result.toolCalls,
           changedFiles: changed?.length ?? null,
           usage,
+          ...(worktree ? { worktree: worktreeRecord(worktree) } : {}),
         });
         await saveResult(sessionId, {
           sessionId, turn, time: record.time, role, model: usedModel, provider: splitKey(usedModel)?.provider ?? picked.provider,
-          effort: chosen.effort, skills: skillNames, workspace: ws, task: task.slice(0, 160),
+          effort: chosen.effort, skills: skillNames, workspace: ws, task: task.slice(0, 160), worktree: worktreeRecord(worktree) ?? null,
           status, stopReason: result.stopReason, abortReason: result.abortReason, diagnostic: result.diagnostic,
           durationMs, toolCalls: result.toolCalls, changedFiles: changed ?? null, usage, text: result.text, body,
         }).catch(() => {});
@@ -357,14 +482,18 @@ export async function apply(ctx) {
         // Report the damage even on failure: an aborted write-mode agent can leave
         // partial edits, and the parent needs to see them to recover.
         const message = String(error.message || error);
-        const after = await gitStatus(ws).catch(() => null);
+        const after = await gitStatus(cwd).catch(() => null);
         const changed = diffStatus(before, after);
         const durationMs = Date.now() - startedAt;
-        const body = [header.join(' | '), `FAILED: ${message}`, describeChanges(before, after)].join('\n');
-        await history.finish(record, { status: 'failed', error: message.slice(0, 300), durationMs, changedFiles: changed?.length ?? null });
+        const worktreeLines = await settleWorktree(worktree, sessionId);
+        const body = [header.join(' | '), `FAILED: ${message}`, describeChanges(before, after), ...worktreeLines].join('\n');
+        await history.finish(record, {
+          status: 'failed', error: message.slice(0, 300), durationMs, changedFiles: changed?.length ?? null,
+          ...(worktree ? { worktree: worktreeRecord(worktree) } : {}),
+        });
         await saveResult(sessionId, {
           sessionId, turn, time: record.time, role, model: picked.key, provider: picked.provider, effort: chosen.effort, skills: skillNames,
-          workspace: ws, task: task.slice(0, 160),
+          workspace: ws, task: task.slice(0, 160), worktree: worktreeRecord(worktree) ?? null,
           status: 'failed', error: message, durationMs, changedFiles: changed ?? null, text: '', body,
         }).catch(() => {});
         return { body, failed: true };
@@ -425,6 +554,7 @@ export async function apply(ctx) {
         time: entry?.time ?? new Date(run.startedAt).toISOString(),
         turns: turns.get(run.sessionId) ?? 1,
         background: entry?.background ?? false,
+        worktree: worktreeSummary(entry?.worktree),
       });
       seen.add(run.sessionId);
     }
@@ -453,7 +583,8 @@ export async function apply(ctx) {
         changedFiles: e.changedFiles ?? null,
         usage: e.usage ? { inputTokens: e.usage.inputTokens, outputTokens: e.usage.outputTokens, cacheHitRatio: Number((e.usage.cacheHitRatio ?? 0).toFixed(3)) } : null,
         background: e.background ?? false,
-        continuable: e.status !== 'running',
+        worktree: worktreeSummary(e.worktree),
+        continuable: e.status !== 'running' && !(e.worktree?.removed),
       });
     }
     return rows
@@ -464,7 +595,7 @@ export async function apply(ctx) {
 
   function buildServer() {
     const server = new McpServer(
-      { name: 'dsh-deepseek-subagent', version: '1.2.0' },
+      { name: 'dsh-deepseek-subagent', version: '1.3.0' },
       { capabilities: { tools: {} } },
     );
 
@@ -540,18 +671,88 @@ export async function apply(ctx) {
       description:
         'Delegate a CODE-CHANGE task to a local DeepSeek Harness agent (any configured provider/model). The agent can read, write, edit files and run commands '
         + 'inside the workspace. Refuses to run on a dirty git tree (unless allowDirty=true) so a rollback point always exists. '
+        + 'With isolation: "worktree" the agent works in a fresh git worktree of the repo on its own branch (<repo>/.dsh/worktrees/…), so your checkout is untouched '
+        + 'even if dirty and several code delegations can run in parallel; the result then says where the worktree is and deepseek_worktree lets you diff, commit, apply or remove it. '
         + 'The result always includes the list of changed files and the sessionId, which deepseek_continue can resume if the run stopped early.',
       inputSchema: {
         ...shared,
-        allowDirty: z.boolean().optional().describe('Allow running even if the workspace has uncommitted changes.'),
+        allowDirty: z.boolean().optional().describe('Allow running even if the workspace has uncommitted changes (in-place mode only).'),
+        isolation: z.enum(['inplace', 'worktree']).optional().describe(
+          'Where the agent edits. "inplace" (default): your checkout. "worktree": a separate git worktree on a new branch, created from `base` — '
+          + 'use it when your tree is dirty, when you run several code delegations at once, for large or risky changes, or when the user asks for a branch. '
+          + 'A worktree with no changes is removed automatically; one with changes stays until deepseek_worktree removes it. The agent cannot commit there; you take the work with deepseek_worktree.',
+        ),
+        branch: z.string().optional().describe('worktree only: branch name to create. Default dsh/<task-slug>-<id>.'),
+        base: z.string().optional().describe('worktree only: commit/branch to start from. Default HEAD (what you are on now).'),
+        linkDirs: z.array(z.string()).max(8).optional().describe('worktree only: gitignored directories of your checkout to share read-only into the worktree via junction/symlink. Default ["node_modules"]; pass [] for none.'),
+        includeUncommitted: z.boolean().optional().describe('worktree only: also copy your uncommitted changes and untracked files into the worktree so the agent starts from what you see. Default false.'),
       },
     }, (args, extra) => delegate('code', args, extra));
+
+    server.registerTool('deepseek_worktree', {
+      title: 'Inspect, take or remove a delegation worktree',
+      description:
+        'For a session that ran with isolation: "worktree". "status": path, branch and what changed. "diff": the full diff against the base. '
+        + '"commit": commit everything in the worktree on its branch (the agent cannot; the server does it for you) so you can `git merge <branch>`. '
+        + '"apply": copy the worktree\'s changes into your own working tree as uncommitted changes (3-way). '
+        + '"remove": delete the worktree (and its branch when it has no unmerged commits). Refused while the session is running.',
+      inputSchema: {
+        sessionId: z.string().describe('Session id from the result header or deepseek_sessions.'),
+        action: z.enum(['status', 'diff', 'commit', 'apply', 'remove']),
+        message: z.string().optional().describe('commit only: the commit message.'),
+        deleteBranch: z.boolean().optional().describe('remove only: also delete the branch when it is merged or has no commits. Default true.'),
+      },
+    }, async ({ sessionId, action, message, deleteBranch }, extra) => {
+      const id = requireSessionId(sessionId);
+      const entry = history.latestForSession(id);
+      if (!entry) throw new Error(`Unknown session ${id}. deepseek_sessions lists the ones this server knows.`);
+      if (!entry.worktree) throw new Error(`Session ${id} did not run in a worktree (its changes are in ${entry.workspace}).`);
+      const wt = entry.worktree;
+      if (wt.removed) throw new Error(`The worktree of session ${id} was already removed.`);
+      if (action !== 'status' && delegator.get(id)) throw new Error(`Session ${id} is still running. Wait for it, or deepseek_cancel first.`);
+      if (!(await worktreeExists(wt))) {
+        await history.markWorktreeRemoved(id);
+        throw new Error(`Worktree ${wt.path} no longer exists on disk (removed outside this server); the session is now marked as such.`);
+      }
+      const signal = extra?.signal;
+      const head = `worktree: ${wt.path} | branch: ${wt.branch} | base: ${wt.base.slice(0, 7)}`;
+      switch (action) {
+        case 'status': {
+          const state = await worktreeState(wt, signal);
+          return json({ sessionId: id, ...worktreeSummary(wt), repo: wt.repo, running: Boolean(delegator.get(id)), clean: state.clean, commits: state.commits, changes: state.status });
+        }
+        case 'diff': {
+          const d = await worktreeDiff(wt, signal);
+          return text([head, d.stat || '(no changes)', '', d.patch, ...(d.truncated ? [`[diff truncated at 200 KB — git -C "${wt.path}" diff ${wt.base.slice(0, 7)} for the rest]`] : [])].join('\n'));
+        }
+        case 'commit': {
+          if (typeof message !== 'string' || !message.trim()) throw new Error('message is required for commit.');
+          const sha = await commitWorktree(wt, message.trim(), signal);
+          return text(sha
+            ? `${head}\nCommitted ${sha} on ${wt.branch}. Merge it with: git merge ${wt.branch}   (then deepseek_worktree({ sessionId: "${id}", action: "remove" }))`
+            : `${head}\nNothing to commit — the worktree has no changes.`);
+        }
+        case 'apply': {
+          const r = await applyWorktree(wt, signal);
+          return text(r.applied
+            ? `${head}\nApplied ${r.files.length} file(s) onto ${wt.repo} as uncommitted changes:\n${r.files.map(f => `  ${f}`).join('\n')}\nReview with git diff, then deepseek_worktree({ sessionId: "${id}", action: "remove" }).`
+            : `${head}\nNothing to apply — the worktree has no changes.`);
+        }
+        case 'remove': {
+          const notes = await removeWorktree(wt, { deleteBranch: deleteBranch ?? true, signal });
+          await delegator.forgetWorkspace(wt.path);
+          await history.markWorktreeRemoved(id);
+          return text(`Removed worktree ${wt.path}.${notes.length ? ` ${notes.join('; ')}.` : ''}`);
+        }
+        default: throw new Error(`unknown action ${action}`);
+      }
+    });
 
     server.registerTool('deepseek_sessions', {
       title: 'List DeepSeek sessions',
       description:
         'Lists delegations made through this server: running ones first (with elapsed time, tool calls so far and the last tool), '
-        + 'then finished ones newest first with status, why they stopped, duration, cost and changed-file count. '
+        + 'then finished ones newest first with status, why they stopped, duration, cost, changed-file count and, for isolated runs, the worktree (path, branch, whether it still exists). '
         + 'Any finished session can be resumed with deepseek_continue; a running one can be stopped with deepseek_cancel or nudged with deepseek_steer.',
       inputSchema: {
         workspace: z.string().optional().describe('Only sessions for this workspace path.'),
@@ -594,7 +795,7 @@ export async function apply(ctx) {
       description:
         'Sends a follow-up turn to a FINISHED delegation and returns its new report. The agent resumes with everything it already read and did, '
         + 'so this is the cheap way to say "carry on where you stopped", "now also handle X", or to ask a research agent a follow-up question. '
-        + 'The tree is usually dirty from the previous turn, so allowDirty defaults to true here. '
+        + 'The tree is usually dirty from the previous turn, so allowDirty defaults to true here. A worktree session continues in its worktree (refused once that was removed). '
         + 'Without `model` the turn runs on the model the session started with (never asks); pass `model` to switch. Without `reasoningEffort` it keeps the previous effort of the session.',
       inputSchema: {
         sessionId: z.string().describe('Session id from a result header or deepseek_sessions.'),
@@ -837,6 +1038,7 @@ export async function apply(ctx) {
         task: r.task,
         workspace: r.workspace,
         background: r.background ?? false,
+        worktree: worktreeSummary(r.worktree),
       };
     });
   }
@@ -950,6 +1152,17 @@ export async function apply(ctx) {
           const removed = await history.remove(ids);
           await Promise.all(ids.map(id => deleteResult(id).catch(() => {})));
           return json(200, { ok: true, removed, archived: archived.length, notArchived: ids.length - archived.length });
+        }
+        if (req.method === 'POST' && route === '/worktree') {
+          const id = requireSessionId(body.sessionId);
+          if (body.action !== 'remove') return json(400, { error: 'unsupported action' });
+          const entry = history.latestForSession(id);
+          if (!entry?.worktree || entry.worktree.removed) return json(200, { error: 'This session has no worktree to remove.' });
+          if (delegator.get(id)) return json(200, { error: 'The session is still running. Stop it first.' });
+          if (await worktreeExists(entry.worktree)) await removeWorktree(entry.worktree, {});
+          await delegator.forgetWorkspace(entry.worktree.path);
+          await history.markWorktreeRemoved(id);
+          return json(200, { ok: true });
         }
         if (req.method === 'POST' && route === '/restart') {
           const live = delegator.list().length;

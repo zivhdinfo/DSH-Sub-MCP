@@ -20,6 +20,7 @@ import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
 import { finalAssistantOutput } from '@deepseek-ai/dsh-subagent';
 import * as toolSkill from '@deepseek-ai/dsh-tool-skill';
 import { keyOf } from './models.mjs';
+import { isInside } from './workspace.mjs';
 
 const READ_TOOLS = ['read', 'read_image', 'glob', 'grep'];
 const WRITE_TOOLS = [...READ_TOOLS, 'write', 'edit', 'bash', 'pwsh'];
@@ -211,13 +212,26 @@ function skillRules(skills) {
     + 'Load each with the `skill` tool before starting and follow its instructions; you may read files under the resource directory a loaded skill names.';
 }
 
-function buildPrompt({ role, task, workspace, limits, continuation, skills }) {
+// A worktree session: the agent must know its checkout is a copy, that the
+// original is off limits, and that committing is not its job (the shared .git
+// lives outside its sandbox root, so git writes fail there anyway).
+function worktreeRules(worktree) {
+  if (!worktree) return '';
+  const links = worktree.links?.length
+    ? ` ${worktree.links.map(l => `\`${l}\``).join(', ')} ${worktree.links.length === 1 ? 'is' : 'are'} shared read-only from the main checkout; if a tool needs to write there (a test cache, say), disable its cache instead of reinstalling.`
+    : '';
+  return `\n\nThis workspace is a git worktree of ${worktree.repo}, on branch ${worktree.branch}. Work ONLY here; never read from or write to ${worktree.repo} itself. `
+    + 'Do not commit, stash, checkout or otherwise write to git — the parent agent reviews and commits your changes; leave them in the working tree. '
+    + `\`git status\` and \`git diff\` are fine.${links}`;
+}
+
+function buildPrompt({ role, task, workspace, limits, continuation, skills, worktree }) {
   const budget = `You have a budget of ${limits.maxToolCalls} tool calls; leave room to verify and to write the final report.`;
   if (continuation) {
     return `Workspace: ${workspace}\n\nFOLLOW-UP from the parent agent (same session — you keep everything you already read and did):\n${task}\n\n`
-      + `${roleRules(role)} ${budget} Start from the state you left; do not redo work that is already done.${skillRules(skills)}`;
+      + `${roleRules(role)} ${budget} Start from the state you left; do not redo work that is already done.${skillRules(skills)}${worktreeRules(worktree)}`;
   }
-  return `Workspace: ${workspace}\n\nTASK:\n${task}\n\n${roleRules(role)} ${budget}${skillRules(skills)}`;
+  return `Workspace: ${workspace}\n\nTASK:\n${task}\n\n${roleRules(role)} ${budget}${skillRules(skills)}${worktreeRules(worktree)}`;
 }
 
 // Register the selected skills in the agent's own scope and give it the
@@ -269,13 +283,34 @@ function message(text) {
   return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
 }
 
+// The sandbox already refuses writes outside the worktree; this turns the
+// obvious cases — a command run from, or a file written into, the main
+// checkout — into a message that names the worktree instead of a bare denial.
+const WRITE_TOOL_ARGS = { bash: ['workdir'], pwsh: ['workdir'], write: ['path', 'file_path'], edit: ['path', 'file_path'] };
+export function worktreeEscape(worktree, name, args) {
+  const keys = WRITE_TOOL_ARGS[name];
+  if (!keys || !args || typeof args !== 'object') return null;
+  for (const key of keys) {
+    const value = args[key];
+    if (typeof value !== 'string' || !value.trim() || !path.isAbsolute(value)) continue;
+    if (isInside(worktree.path, value)) continue;
+    const rel = path.relative(worktree.repo, value);
+    const hint = rel && !rel.startsWith('..') && !path.isAbsolute(rel)
+      ? ` The same file lives at ${path.join(worktree.path, rel)} in the worktree.`
+      : '';
+    return `This session is isolated in the git worktree ${worktree.path} (branch ${worktree.branch}); ${key} "${value}" is outside it and cannot be used.${hint}`;
+  }
+  return null;
+}
+
 // Everything the plugin can observe about one live run.
 export class Run {
-  constructor({ sessionId, role, model, workspace, task, turn, guard }) {
+  constructor({ sessionId, role, model, workspace, task, turn, guard, worktree = null }) {
     this.sessionId = sessionId;
     this.role = role;
     this.model = model;
     this.workspace = workspace;
+    this.worktree = worktree;
     this.task = task;
     this.turn = turn;
     this.guard = guard;
@@ -307,6 +342,7 @@ export class Run {
       role: this.role,
       model: this.model,
       workspace: this.workspace,
+      worktree: this.worktree ? { path: this.worktree.path, branch: this.worktree.branch } : null,
       turn: this.turn,
       elapsedMs: this.elapsedMs,
       toolCalls: this.guard.calls,
@@ -326,6 +362,8 @@ export class Delegator {
     ctx.tools.guard(exec => {
       const run = this.runs.get(exec.agent?.session.id);
       if (!run) return;
+      const escape = run.worktree ? worktreeEscape(run.worktree, exec.name, exec.arguments) : null;
+      if (escape) return escape;
       const verdict = run.guard.admit(exec.name, exec.arguments);
       const warning = run.guard.budgetWarning();
       if (warning) queueMicrotask(() => { try { run.agent?.inject(message(warning)); } catch { /* best effort */ } });
@@ -339,11 +377,11 @@ export class Delegator {
   // Register the repo as a workspace so runs can group under it in the sidebar
   // instead of landing in "Ungrouped". `create` returns the existing record
   // when the directory already has one.
-  async ensureWorkspace(workspace) {
+  async ensureWorkspace(workspace, title = path.basename(workspace)) {
     const registry = this.ctx.workspaceRegistry;
     if (!registry) return undefined;
     try {
-      return (await registry.resolveByPath(workspace)) ?? await registry.create(workspace, path.basename(workspace));
+      return (await registry.resolveByPath(workspace)) ?? await registry.create(workspace, title);
     } catch { return undefined; /* grouping is cosmetic; never block a run on it */ }
   }
 
@@ -367,6 +405,22 @@ export class Delegator {
     }
   }
 
+  // Drop the sidebar workspace a removed worktree had. Its sessions keep their
+  // transcripts and can still be opened from the delegations table.
+  async forgetWorkspace(workspace) {
+    const registry = this.ctx.workspaceRegistry;
+    if (!registry) return false;
+    try {
+      // resolveByPath realpaths its argument, which fails once the directory
+      // is gone; the record's canonical path still matches as a string.
+      const wanted = path.resolve(workspace).toLowerCase();
+      const entity = (await registry.resolveByPath(workspace).catch(() => undefined))
+        ?? registry.list().find(e => path.resolve(e.path).toLowerCase() === wanted);
+      if (!entity) return false;
+      return Boolean(await registry.delete(entity.id));
+    } catch { return false; }
+  }
+
   // Hide sessions from the sidebar the way its own "Archive session" does; the
   // transcript stays on disk. Returns the ids the registry accepted.
   async archiveSessions(sessionIds) {
@@ -384,7 +438,7 @@ export class Delegator {
 
   // `signals` maps an abort reason to the signal that carries it, so the record
   // can say WHY a run stopped instead of a bare "aborted".
-  async run({ role, task, workspace, provider, model, reasoningEffort, skills = [], signals = {}, title, maxToolCalls, sessionId: requested, resumeSessionId, turn = 1, onStart }) {
+  async run({ role, task, workspace, provider, model, reasoningEffort, skills = [], signals = {}, title, workspaceTitle, worktree = null, maxToolCalls, sessionId: requested, resumeSessionId, turn = 1, onStart }) {
     const write = role === 'code';
     const limits = { ...this.limits, ...(maxToolCalls ? { maxToolCalls } : {}) };
     const guard = new LoopGuard(limits);
@@ -401,12 +455,12 @@ export class Delegator {
       throw new Error(`Session ${sessionId} is busy in the DSH UI right now. Wait for it to finish there, or stop it in the UI, then call again.`);
     }
 
-    const run = new Run({ sessionId, role, model: keyOf(provider, model), workspace, task, turn, guard });
+    const run = new Run({ sessionId, role, model: keyOf(provider, model), workspace, task, turn, guard, worktree });
     this.runs.set(sessionId, run);
     let handle;
     const detach = [];
     try {
-      const workspaceEntity = await this.ensureWorkspace(workspace);
+      const workspaceEntity = await this.ensureWorkspace(workspace, workspaceTitle);
 
       // Same composition the subagent driver applies in the child's creation
       // window: a persona section, a scoped tool restriction and, when the
@@ -468,7 +522,7 @@ export class Delegator {
       // Only this turn's events count: a resumed session carries its history.
       const from = agent.session.seq;
       if (!run.abortReason) {
-        agent.followup(message(buildPrompt({ role, task, workspace, limits, continuation: Boolean(resumeSessionId), skills })));
+        agent.followup(message(buildPrompt({ role, task, workspace, limits, continuation: Boolean(resumeSessionId), skills, worktree })));
         await agent.whenIdle();
       }
 

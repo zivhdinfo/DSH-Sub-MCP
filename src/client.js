@@ -170,6 +170,10 @@ window.__ModuleLoader__.load({
       workspace: 'Workspace',
       session: 'Session',
       reason: 'Why it stopped',
+      worktree: 'Worktree',
+      worktreeRemoved: 'worktree removed',
+      removeWorktree: 'Remove worktree',
+      removingWorktree: 'Removing…',
       // how-to card
       howtoTitle: 'How to use',
       howtoSub: 'Ask the parent naturally; the installed guidance maps phrases to tools.',
@@ -267,6 +271,10 @@ window.__ModuleLoader__.load({
       workspace: '工作区',
       session: '会话',
       reason: '停止原因',
+      worktree: '工作树',
+      worktreeRemoved: '工作树已删除',
+      removeWorktree: '删除工作树',
+      removingWorktree: '删除中…',
       howtoTitle: '使用方法',
       howtoSub: '用自然语言告诉父代理即可；已安装的指引会把说法映射到工具。',
       howto1: '“用 deepseek 检查 auth 模块有没有 bug”',
@@ -589,10 +597,17 @@ window.__ModuleLoader__.load({
     // One delegation. Clicking the row opens the session in the harness (the
     // dialog closes so the conversation is visible); the chevron shows the
     // task, workspace and id in place; the checkbox is for bulk deletion.
-    function RunRow({ run, now, t, onStop, onOpen, selected, onSelect }) {
+    function RunRow({ run, now, t, onStop, onOpen, onRemoveWorktree, selected, onSelect }) {
       const [open, setOpen] = useState(false);
       const [stopping, setStopping] = useState(false);
+      const [removingWorktree, setRemovingWorktree] = useState(false);
       const running = run.status === 'running';
+      const worktree = run.worktree ?? null;
+      const removeWorktree = async event => {
+        event.stopPropagation();
+        setRemovingWorktree(true);
+        try { await onRemoveWorktree(run.sessionId); } finally { setRemovingWorktree(false); }
+      };
       const stats = [];
       if (running) {
         if (run.toolCalls !== null) stats.push(t('calls', { n: fmt(run.toolCalls) }));
@@ -644,6 +659,7 @@ window.__ModuleLoader__.load({
             run.effort ? h(P.Tag, { tone: run.effort === 'max' ? 'info' : 'quiet' }, run.effort) : null,
             run.turn > 1 ? h(P.Tag, { tone: 'quiet' }, t('turn', { n: String(run.turn) })) : null,
             run.background ? h(P.Tag, { tone: 'quiet' }, t('background')) : null,
+            worktree ? h(P.Tag, { tone: worktree.removed ? 'quiet' : 'info' }, worktree.removed ? t('worktreeRemoved') : `⎇ ${worktree.branch}`) : null,
             h('span', { className: 'dsub-muted' }, statusLabel)),
           h('div', { className: 'dsub-rowMeta', title: stats.join(' · ') }, stats.join(' · ') || '—')),
         h('div', { className: 'dsub-rowEnd' },
@@ -660,6 +676,13 @@ window.__ModuleLoader__.load({
         open ? h('div', { className: 'dsub-runDetail' },
           h('p', null, h('b', null, `${t('task')}: `), run.task),
           h('p', null, h('b', null, `${t('workspace')}: `), h('span', { className: 'dsub-code' }, run.workspace)),
+          worktree ? h('p', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+            h('b', null, `${t('worktree')}: `),
+            h('span', { className: 'dsub-code', style: worktree.removed ? { textDecoration: 'line-through' } : undefined }, `${worktree.path} (${worktree.branch})`),
+            !worktree.removed && !running
+              ? h(P.Button, { variant: 'outline', size: 'sm', className: 'dsub-danger', disabled: removingWorktree, onClick: removeWorktree },
+                removingWorktree ? t('removingWorktree') : t('removeWorktree'))
+              : null) : null,
           run.skills?.length ? h('p', null, h('b', null, `${t('skills')}: `), h('span', { className: 'dsub-code' }, run.skills.join(', '))) : null,
           run.reason && !running ? h('p', null, h('b', null, `${t('reason')}: `), run.reason) : null,
           h('p', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
@@ -686,6 +709,11 @@ window.__ModuleLoader__.load({
       });
       const onStop = async sessionId => {
         await api('/cancel', { sessionId }).catch(() => {});
+        reload();
+      };
+      const onRemoveWorktree = async sessionId => {
+        setError(null);
+        try { await api('/worktree', { sessionId, action: 'remove' }); } catch (e) { setError(String(e.message || e)); }
         reload();
       };
       const remove = async () => {
@@ -719,7 +747,7 @@ window.__ModuleLoader__.load({
       },
       state.runs.length
         ? h('ul', { className: 'dsub-rows' }, state.runs.map(run => h(RunRow, {
-          key: run.id, run, now, t, onStop, onOpen: openSession,
+          key: run.id, run, now, t, onStop, onOpen: openSession, onRemoveWorktree,
           selected: Boolean(run.sessionId) && selected.has(run.sessionId), onSelect,
         })))
         : h('div', { className: 'dsub-empty' }, t('runsEmpty')),

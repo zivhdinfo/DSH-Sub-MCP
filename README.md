@@ -38,7 +38,7 @@ Everything else happens on that settings page:
 | Status | Whether a DeepSeek API key is configured (add one under Settings → Models), the MCP endpoint URL, how many delegations are running. **Restart server** relaunches the harness in place (refused while a delegation is running); the page reloads when it is back |
 | Parent agents | **Connect** runs `claude mcp add` / `codex mcp add` for you over **stdio** (auto-start) and installs **usage guidance**: a global skill for Claude Code, a fenced section in Codex's `AGENTS.md`. **Verify** asks the CLI whether the registration is still there. Locates the CLI binaries automatically; safe to click again |
 | Allowed models | Every provider active in the harness, grouped, with its API-key status, and a **switch** per model (`provider/model`). A model switched off is refused if the parent requests it. With **one** model on, the parent uses it silently; with **two or more**, a call without `model` is refused and the parent must ask you which to use. **Refresh DeepSeek** re-probes the DeepSeek API for retired ids |
-| Recent delegations | Every run with role, model, status, **why it stopped / what it is doing now**, duration, tokens in/out, **cache-hit ratio** and changed files. **Click a row to open that session's conversation**; the chevron shows the task, workspace and session id; a running row has a **Stop** button. Tick rows and **Delete** to drop them from the list and their stored reports (the harness archives the transcript — hidden from the sidebar, never erased) |
+| Recent delegations | Every run with role, model, status, **why it stopped / what it is doing now**, duration, tokens in/out, **cache-hit ratio** and changed files. **Click a row to open that session's conversation**; the chevron shows the task, workspace, session id and — for an isolated run — the worktree with a **Remove worktree** button; a running row has a **Stop** button. Tick rows and **Delete** to drop them from the list and their stored reports (the harness archives the transcript — hidden from the sidebar, never erased) |
 | How to use | The phrases that trigger each tool |
 
 The page is a DSH client plugin (`src/client.js`, declared as `dsh.client` in `package.json`), rendered by the harness's own Settings dialog with its own components and theme; the host half serves it JSON under `/dsh-sub/*`. It is also reachable from any browser as `http://127.0.0.1:3083/setup?key=<mcp token>`, which signs you into the UI and opens the section.
@@ -101,7 +101,8 @@ After connecting once, **you never start anything by hand again**: launching Cla
 | `deepseek_models(refresh?)` | — | Every active provider with its models, key status and enabled flags (`enabled` = the usable `provider/model` keys) |
 | `deepseek_skills(workspace?, refresh?)` | — | The parent's skills (SKILL.md files) that can be attached to a delegation by name |
 | `deepseek_research(task, workspace, …)` | `read, read_image, glob, grep` | Analysis, review, exploration — **never writes** |
-| `deepseek_code(task, workspace, allowDirty?, …)` | plus `write, edit, bash, pwsh` | Actual code changes |
+| `deepseek_code(task, workspace, allowDirty?, isolation?, …)` | plus `write, edit, bash, pwsh` | Actual code changes — in place, or in a git worktree of their own (below) |
+| `deepseek_worktree(sessionId, action, message?)` | — | `status` / `diff` / `commit` / `apply` / `remove` the worktree a session ran in |
 
 Shared options: `model?` (`provider/model`), `reasoningEffort?` (default `high`; `max` for hard tasks), `skills?` (names), `timeoutSec?` (default 900, max 3600), `maxToolCalls?` (default 150, 20–400), `background?`.
 
@@ -110,9 +111,22 @@ Shared options: `model?` (`provider/model`), `reasoningEffort?` (default `high`;
 - `model` is one string, `provider/model` (`deepseek-official/deepseek-flash`, `zai/glm-5.3`). A bare id is accepted only when it is unique across providers. **Ask-first rule:** when more than one model is enabled and `model` is omitted, the call is refused with `MODEL REQUIRED` and the list, so the parent asks the user instead of guessing. `deepseek_continue` never asks — it stays on its session's model unless `model` is passed.
 - `reasoningEffort` is validated against the levels the model offers (`deepseek_models` lists them; DeepSeek: off/low/high/max). Default `high`; the parent's guidance says to use `max` for hard tasks. A continuation keeps the session's previous effort unless one is passed. The header shows it as `effort: …`.
 - `skills: ["name", …]` attaches the parent's own skills (see below).
-- `deepseek_code` **refuses a dirty git tree** (unless `allowDirty: true`) so a rollback point always exists.
+- `deepseek_code` **refuses a dirty git tree** (unless `allowDirty: true`, or `isolation: "worktree"`) so a rollback point always exists.
 - Every result, including failures, carries `stopReason`, the **session id**, and the list of changed files.
 - `background: true` returns at once with the session id; the agent keeps working and the report is read later with `deepseek_result`.
+
+### Worktree isolation: let the sub-agent code on its own branch
+
+The parent decides, per `deepseek_code` call, whether the agent edits the parent's checkout (`isolation: "inplace"`, the default) or a **git worktree of its own** (`isolation: "worktree"`) — the same choice Claude Code offers its subagents, and one Codex CLI's `spawn_agent` cannot make yet. The installed guidance tells the parent when to pick which: a dirty tree, several code delegations at once, a large or risky change, or the user asking for a branch → worktree; a small edit the user wants to see right away → in place.
+
+What the server does for a worktree run:
+
+- `git worktree add` under `<repo>/.dsh/worktrees/<name>` on a new branch `dsh/<task-slug>-<id>` (or `branch`) from `HEAD` (or `base`), locked while the agent runs. `.dsh/` is added to `.git/info/exclude` (local to the clone, so nothing shows as untracked and ripgrep-based tools skip it), and the session's cwd — and so its **sandbox root** — is the worktree.
+- `node_modules` (any gitignored directory in `linkDirs`, default `["node_modules"]`) is junction-linked from the main checkout, read-only for the agent. Files matching a `.worktreeinclude` in the repo root (same file and semantics as Claude Code's; `.env` and the like) are copied. `includeUncommitted: true` also carries the parent's uncommitted changes and untracked files over.
+- Absolute paths into the main checkout inside `task` are rewritten to the worktree, and the agent is told it is in a worktree and must not commit.
+- When the run ends: a worktree with **no changes is removed automatically**, branch included. One with changes stays; the result names the path and branch and lists the three moves — review (`deepseek_worktree diff`), take (`commit` on the branch, then `git merge`; or `apply`, which copies the changes into the parent's working tree uncommitted and is refused when they do not apply cleanly), drop (`remove`). `deepseek_continue` keeps working in the same worktree until it is removed. Each worktree appears in the DSH sidebar as its own workspace, `<repo> ⎇ <branch>`, dropped again when the worktree is.
+
+Why the agent cannot commit: the DSH sandbox (`workspace-write`) confines every write of the agent to its session cwd. That is what makes the isolation hard — even a confused agent cannot touch the main checkout — but the shared `.git` directory lives outside the worktree, so `git add`/`commit`/`stash`/`checkout` fail there while `git status`/`diff`/`log` work. The server runs the git writes (`commit`, `apply`, `remove`) unconfined on the parent's request. Removal unlinks `node_modules` first: `git worktree remove` does not follow a junction into the main checkout, but leaves it behind.
 
 ### Sessions: list, read, continue, steer, cancel
 
@@ -120,7 +134,7 @@ Every delegation is a persisted DSH session, and the parent can keep working wit
 
 | Tool | What it does |
 |---|---|
-| `deepseek_sessions(workspace?, status?, limit?)` | Running sessions first (elapsed, tool calls so far, last tool), then finished ones newest first with status, **why they stopped**, duration, cost and changed-file count. |
+| `deepseek_sessions(workspace?, status?, limit?)` | Running sessions first (elapsed, tool calls so far, last tool), then finished ones newest first with status, **why they stopped**, duration, cost, changed-file count and the worktree (path, branch, removed or not) for isolated runs. `workspace` matches the repo the parent passed, so worktree runs are listed under it. |
 | `deepseek_result(sessionId, waitSec?)` | The full report of a session — after a background run, after the parent's own timeout, or to re-read an old one. For a running session it waits up to `waitSec`, then reports progress instead. |
 | `deepseek_continue(sessionId, message, role?, …)` | Sends a **follow-up turn to a finished session**. The agent resumes with everything it already read and did — "carry on where you stopped", "now also handle X", or a follow-up question to a research agent. `role` can switch capability for that turn; `allowDirty` defaults to true because the tree is usually dirty from the previous turn. If the session is open in the DSH UI, the turn runs on the agent the UI holds (its model and preset, narrowed to the role's tools) and shows up there live. |
 | `deepseek_steer(sessionId, message)` | Injects a message into a **running** session; the agent reads it at its next step. |
