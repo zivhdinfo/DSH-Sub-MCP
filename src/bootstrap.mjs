@@ -3,7 +3,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readCachedModels } from './models.mjs';
+import { readDeepSeekLive } from './deepseek-live.mjs';
 
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 // Overridable so a second instance (e.g. for testing) can run beside the live
@@ -53,19 +53,21 @@ async function scaffoldProfile() {
   return dir;
 }
 
+// The llm-deepseek adapter serves exactly the ids we hand it here; the live
+// probe (deepseek-live.mjs) keeps that list free of retired ids. Other
+// providers are configured by the user in settings.yaml and need nothing here.
 function catalogForAdapter(models) {
-  const live = models.filter(m => m.listed);
-  return (live.length ? live : models).map(m => ({
-    id: m.model,
-    name: m.label || m.model,
-    ...(CAPABILITIES[m.model] ?? {}),
+  return models.map(m => ({
+    id: m.id,
+    name: m.name || m.id,
+    ...(CAPABILITIES[m.id] ?? {}),
   }));
 }
 
 export async function build() {
   await mkdir(home, { recursive: true });
   const profileDir = await scaffoldProfile();
-  const catalog = await readCachedModels(home);
+  const live = await readDeepSeekLive(home);
 
   const patch = [
     // dsh-web-app disables the base agent-plane tools and re-exposes them through
@@ -82,24 +84,26 @@ export async function build() {
         baseURL: 'https://api.deepseek.com',
         reasoningEffort: 'high',
         maxTokens: 32768,
-        models: catalogForAdapter(catalog.models),
+        models: catalogForAdapter(live.models),
       },
     },
+    // The harness's own chat UI still needs a process-wide default; delegations
+    // pick their model explicitly (see models.mjs).
     {
       id: 'agent-default-model',
-      config: { provider: 'deepseek-official', model: catalog.defaultModel() },
+      config: { provider: 'deepseek-official', model: live.preferredModel() },
     },
     { insert: [{ id: 'deepseek-sub-mcp', name: pluginEntry }] },
   ];
 
   await writeFile(patchFile, JSON.stringify(patch, null, 2));
-  return { patchFile, profileDir, home, port, catalog: catalog.snapshot() };
+  return { patchFile, profileDir, home, port, deepseek: live.snapshot() };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const result = await build();
-  const { models, defaultModel, catalogStale, catalogCheckedAt } = result.catalog;
+  const { models, stale, checkedAt } = result.deepseek;
   console.log(`DSH-Sub-MCP prepared: ${result.patchFile}`);
-  console.log(`Models (${models.length}): ${models.map(m => m.model + (m.listed ? '' : ' [retired]')).join(', ')}`);
-  console.log(`Default: ${defaultModel} | checked: ${catalogCheckedAt ?? 'never'}${catalogStale ? ' | STALE — will be re-probed when the harness starts' : ''}`);
+  console.log(`DeepSeek models (${models.length}): ${models.map(m => m.id).join(', ')}`);
+  console.log(`Checked: ${checkedAt ?? 'never'}${stale ? ' | STALE — will be re-probed when the harness starts' : ''}`);
 }

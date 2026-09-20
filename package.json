@@ -1,6 +1,6 @@
 {
   "name": "dsh-sub-mcp",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "DeepSeek subagents exposed to Claude Code / Codex CLI over MCP, running inside the DSH harness",
@@ -25,6 +25,7 @@
   "dependencies": {
     "@deepseek-ai/dsh": "0.1.5-rc.2",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "yaml": "^2.9.1",
     "zod": "^4.6.5"
   }
 }

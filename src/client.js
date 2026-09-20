@@ -46,6 +46,10 @@ window.__ModuleLoader__.load({
 .dsub-rows{display:flex;flex-direction:column;margin:0;padding:0;list-style:none}
 .dsub-row{display:flex;align-items:center;gap:10px;min-height:36px;padding:5px 0;border-top:.5px solid var(--dsw-alias-border-l2)}
 .dsub-row:first-child{border-top:none}
+.dsub-group{display:flex;align-items:center;gap:8px;min-height:32px;padding:10px 0 4px;font-size:13px;font-weight:500;border-top:.5px solid var(--dsw-alias-border-l2)}
+.dsub-group:first-child{border-top:none;padding-top:2px}
+.dsub-group .dsub-code{font-weight:400;color:var(--dsw-alias-label-tertiary)}
+.dsub-group+.dsub-row{border-top:none}
 .dsub-rowMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .dsub-rowName{font-size:13px;line-height:20px;display:flex;align-items:center;gap:6px;min-width:0}
 .dsub-rowName>*{flex:none;white-space:nowrap}
@@ -106,6 +110,11 @@ window.__ModuleLoader__.load({
       apiKey: 'DeepSeek API key',
       keyConfigured: 'Configured',
       keyMissing: 'Missing — add it under Settings → Models, then come back.',
+      providers: 'Providers',
+      providersText: '{usable} of {total} ready — add or fix API keys under Settings → Models.',
+      skills: 'Skills',
+      skillsText: '{n} attachable from {roots} directories',
+      skillsNone: 'No SKILL.md found in the usual Claude Code / Codex directories.',
       endpoint: 'MCP endpoint',
       copy: 'Copy',
       copied: 'Copied',
@@ -126,15 +135,21 @@ window.__ModuleLoader__.load({
       verifying: 'Checking…',
       // models card
       modelsTitle: 'Allowed models',
-      modelsSub: 'A model switched off here is refused when the parent asks for it.',
-      refresh: 'Refresh',
+      modelsSub: 'Every provider active in this harness. Switch on the models the parent may delegate to; with more than one switched on, the parent has to ask you which to use for each delegation.',
+      refresh: 'Refresh DeepSeek',
       refreshing: 'Refreshing…',
       serving: 'serving',
       retired: 'left the API',
-      default: 'default',
       modelToggle: 'Allow {model}',
-      catalogSynced: 'Default: {model} · synced {when}',
-      catalogUnverified: 'Default: {model} · not yet verified against the API',
+      providerNoKey: 'no API key',
+      providerError: 'configuration error',
+      context: '{n}k context',
+      efforts: 'effort {levels}',
+      enabledNone: 'No model is switched on — delegations are refused until one is.',
+      enabledOne: 'Enabled: {model} · used without asking.',
+      enabledMany: '{n} models enabled · the parent must ask you which one to use.',
+      catalogSynced: 'DeepSeek catalog synced {when}',
+      catalogUnverified: 'DeepSeek catalog not yet verified against the API',
       // runs card
       runsTitle: 'Recent delegations',
       runsSub: '{shown} most recent of {total}. Click a row for the task and session id.',
@@ -195,6 +210,11 @@ window.__ModuleLoader__.load({
       apiKey: 'DeepSeek API 密钥',
       keyConfigured: '已配置',
       keyMissing: '未配置 — 请先在“设置 → 模型”中添加，然后回到这里。',
+      providers: '提供商',
+      providersText: '{total} 个中有 {usable} 个可用 — 请在“设置 → 模型”中添加或修复 API 密钥。',
+      skills: '技能',
+      skillsText: '{n} 个可附加，来自 {roots} 个目录',
+      skillsNone: '在常见的 Claude Code / Codex 目录中未找到 SKILL.md。',
       endpoint: 'MCP 端点',
       copy: '复制',
       copied: '已复制',
@@ -213,15 +233,21 @@ window.__ModuleLoader__.load({
       verify: '检查',
       verifying: '检查中…',
       modelsTitle: '允许的模型',
-      modelsSub: '在此关闭的模型，父代理请求时会被拒绝。',
-      refresh: '刷新',
+      modelsSub: '本 Harness 中所有启用的提供商。打开允许父代理委托的模型；打开多个时，父代理每次委托前必须先问你用哪个。',
+      refresh: '刷新 DeepSeek',
       refreshing: '刷新中…',
       serving: '可用',
       retired: '已从 API 下线',
-      default: '默认',
       modelToggle: '允许 {model}',
-      catalogSynced: '默认：{model} · 同步于 {when}',
-      catalogUnverified: '默认：{model} · 尚未与 API 核对',
+      providerNoKey: '缺少 API 密钥',
+      providerError: '配置错误',
+      context: '{n}k 上下文',
+      efforts: '思考强度 {levels}',
+      enabledNone: '没有打开任何模型 — 在打开之前委托会被拒绝。',
+      enabledOne: '已启用：{model} · 无需询问直接使用。',
+      enabledMany: '已启用 {n} 个模型 · 父代理必须先问你用哪个。',
+      catalogSynced: 'DeepSeek 目录同步于 {when}',
+      catalogUnverified: 'DeepSeek 目录尚未与 API 核对',
       runsTitle: '最近的委托',
       runsSub: '显示最近 {shown} 条，共 {total} 条。点击查看任务与会话 ID。',
       runsEmpty: '还没有委托。当 Claude Code 或 Codex 调用 deepseek 工具时会显示在这里。',
@@ -411,6 +437,16 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsub-inlineDot' },
             h(P.StateDot, { state: state.key.configured ? 'done' : 'error', size: 8 }),
             state.key.configured ? t('keyConfigured') : t('keyMissing'))),
+        h('dt', null, t('providers')),
+        h('dd', null,
+          h('span', { className: 'dsub-inlineDot' },
+            h(P.StateDot, { state: state.providers.usable > 0 ? (state.providers.usable === state.providers.total ? 'done' : 'warning') : 'error', size: 8 }),
+            t('providersText', { usable: String(state.providers.usable), total: String(state.providers.total) }))),
+        h('dt', null, t('skills')),
+        h('dd', { title: (state.skills?.roots ?? []).map(r => `${r.dir} (${r.count})`).join('\n') },
+          state.skills?.total
+            ? t('skillsText', { n: String(state.skills.total), roots: String(state.skills.roots.length) })
+            : t('skillsNone')),
         h('dt', null, t('endpoint')),
         h('dd', null, h('span', { className: 'dsub-code' }, state.mcpUrl), h(CopyButton, { text: state.mcpUrl, t })),
         h('dt', null, t('activity')),
@@ -466,16 +502,18 @@ window.__ModuleLoader__.load({
         log ? h('pre', { className: 'dsub-log', 'data-ok': log.ok }, log.text) : null);
     }
 
+    // One provider group: a header with the credential dot (same rule as the
+    // harness's Models page), then a switch per model. Keys are "provider/model".
     function ModelsCard({ state, t, setCatalog }) {
       const [error, setError] = useState(null);
       const [refreshing, setRefreshing] = useState(false);
       const [saving, setSaving] = useState(null);
       const catalog = state.catalog;
-      const toggle = async (model, enabled) => {
-        setSaving(model);
+      const toggle = async (key, enabled) => {
+        setSaving(key);
         setError(null);
         try {
-          const result = await api('/model', { model, enabled });
+          const result = await api('/model', { key, enabled });
           setCatalog(result.catalog);
         } catch (e) {
           setError(String(e.message || e));
@@ -495,9 +533,46 @@ window.__ModuleLoader__.load({
           setRefreshing(false);
         }
       };
-      const meta = catalog.catalogStale || !catalog.catalogCheckedAt
-        ? t('catalogUnverified', { model: catalog.defaultModel })
-        : t('catalogSynced', { model: catalog.defaultModel, when: ago(catalog.catalogCheckedAt, Date.parse(state.now)) });
+      const enabled = catalog.enabled ?? [];
+      const summary = enabled.length === 0
+        ? t('enabledNone')
+        : enabled.length === 1 ? t('enabledOne', { model: enabled[0] }) : t('enabledMany', { n: String(enabled.length) });
+      const live = catalog.deepseekLive;
+      const liveMeta = live
+        ? (live.stale || !live.checkedAt ? t('catalogUnverified') : t('catalogSynced', { when: ago(live.checkedAt, Date.parse(state.now)) }))
+          + (live.message ? ` · ${live.message}` : '')
+        : '';
+      const rows = [];
+      for (const p of catalog.providers ?? []) {
+        const dot = !p.apiKeyEnv ? 'done' : p.credential?.configured ? 'done' : 'error';
+        rows.push(h('li', { className: 'dsub-group', key: `group:${p.id}` },
+          h(P.StateDot, { state: p.error ? 'warning' : dot, size: 8 }),
+          h('span', { className: 'dsub-shrink' }, p.name),
+          p.name !== p.id ? h('span', { className: 'dsub-code' }, p.id) : null,
+          p.apiKeyEnv && !p.credential?.configured ? h(P.Tag, { tone: 'warning' }, t('providerNoKey')) : null,
+          p.error ? h(P.Tag, { tone: 'warning', title: p.error }, t('providerError')) : null));
+        for (const m of p.models) {
+          const meta = [
+            m.name && m.name !== m.id ? m.name : null,
+            m.contextWindow ? t('context', { n: String(Math.round(m.contextWindow / (m.contextWindow % 1024 === 0 ? 1024 : 1000))) }) : null,
+            m.reasoning?.efforts?.length ? t('efforts', { levels: m.reasoning.efforts.join('/') }) : null,
+          ].filter(Boolean).join(' · ');
+          rows.push(h('li', { className: 'dsub-row', key: m.key },
+            h(P.Switch, {
+              checked: m.enabled === true,
+              disabled: !p.usable || m.listed === false || saving === m.key,
+              label: t('modelToggle', { model: m.key }),
+              onChange: next => toggle(m.key, next),
+            }),
+            h('div', { className: 'dsub-rowMain' },
+              h('div', { className: 'dsub-rowName' }, h('span', { className: 'dsub-code' }, m.id)),
+              meta ? h('div', { className: 'dsub-rowMeta' }, meta) : null),
+            m.listed !== null && m.listed !== undefined
+              ? h('div', { className: 'dsub-rowEnd' },
+                h(P.Tag, { tone: m.listed ? 'success' : 'warning' }, m.listed ? t('serving') : t('retired')))
+              : null));
+        }
+      }
       return h(Card, {
         title: t('modelsTitle'),
         sub: t('modelsSub'),
@@ -506,22 +581,8 @@ window.__ModuleLoader__.load({
           icon: h(P.IconRefreshOutline14, { size: 14 }),
         }, refreshing ? t('refreshing') : t('refresh')),
       },
-      h('ul', { className: 'dsub-rows' },
-        catalog.models.map(m => h('li', { className: 'dsub-row', key: m.model },
-          h(P.Switch, {
-            checked: m.enabled !== false,
-            disabled: !m.listed || saving === m.model,
-            label: t('modelToggle', { model: m.model }),
-            onChange: next => toggle(m.model, next),
-          }),
-          h('div', { className: 'dsub-rowMain' },
-            h('div', { className: 'dsub-rowName' },
-              h('span', { className: 'dsub-code' }, m.model),
-              m.model === catalog.defaultModel ? h(P.Tag, { tone: 'info' }, t('default')) : null),
-            m.label && m.label !== m.model ? h('div', { className: 'dsub-rowMeta' }, m.label) : null),
-          h('div', { className: 'dsub-rowEnd' },
-            h(P.Tag, { tone: m.listed ? 'success' : 'warning' }, m.listed ? t('serving') : t('retired')))))),
-      h('p', { className: 'dsub-muted' }, meta, catalog.message ? ` · ${catalog.message}` : ''),
+      h('ul', { className: 'dsub-rows' }, rows),
+      h('p', { className: 'dsub-muted' }, summary, liveMeta ? ` · ${liveMeta}` : ''),
       error ? h('p', { className: 'dsub-error', role: 'alert' }, error) : null);
     }
 
@@ -580,6 +641,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dsub-rowName' },
             h(P.Tag, { tone: run.role === 'code' ? 'solid' : 'neutral' }, run.role),
             h('span', { className: 'dsub-code' }, run.model),
+            run.effort ? h(P.Tag, { tone: run.effort === 'max' ? 'info' : 'quiet' }, run.effort) : null,
             run.turn > 1 ? h(P.Tag, { tone: 'quiet' }, t('turn', { n: String(run.turn) })) : null,
             run.background ? h(P.Tag, { tone: 'quiet' }, t('background')) : null,
             h('span', { className: 'dsub-muted' }, statusLabel)),
@@ -598,6 +660,7 @@ window.__ModuleLoader__.load({
         open ? h('div', { className: 'dsub-runDetail' },
           h('p', null, h('b', null, `${t('task')}: `), run.task),
           h('p', null, h('b', null, `${t('workspace')}: `), h('span', { className: 'dsub-code' }, run.workspace)),
+          run.skills?.length ? h('p', null, h('b', null, `${t('skills')}: `), h('span', { className: 'dsub-code' }, run.skills.join(', '))) : null,
           run.reason && !running ? h('p', null, h('b', null, `${t('reason')}: `), run.reason) : null,
           h('p', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
             h('b', null, `${t('session')}: `),

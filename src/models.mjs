@@ -1,205 +1,259 @@
-// Live DeepSeek model discovery. The adapter's built-in catalog is stale by design
-// (it still lists retired ids), so the API is the only source of truth we trust.
-import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+// Model directory: every provider route the harness has registered (DeepSeek,
+// plus whatever the user declared under Settings → Models, e.g. a `zai` route
+// with GLM models), each with its models, its credential status and the
+// per-model delegation switch from the Sub-agent settings page.
+//
+// This mirrors how the harness's own Models page builds its list: registered
+// routes ∩ configurable-provider directory, the route's `apiKeyEnv` read from
+// its settings section, then ctx.credentials.describe() for the green dot.
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { credentialRef } from '@deepseek-ai/dsh-credentials';
+import { atomicWrite } from './deepseek-live.mjs';
 
-export const CATALOG_URL = 'https://api.deepseek.com/models';
-export const PROVIDER = 'deepseek-official';
+export const DEEPSEEK = 'deepseek-official';
+const CACHE_MS = 30000;
+const KEY = /^([^/\s]+)\/(\S+)$/;
 
-// Only reached on a first run with no cache and no reachable API. Always flagged stale.
-export const SEED = [
-  { model: 'deepseek-flash', label: 'DeepSeek-V4.1-Flash', listed: true },
-  { model: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro-0813', listed: true },
-];
+export const keyOf = (provider, model) => `${provider}/${model}`;
 
-// Preference order when nothing is pinned; first surviving entry wins.
-export const PREFERRED = ['deepseek-flash', 'deepseek-v4-pro'];
-
-const clean = value => (typeof value === 'string' ? value.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200) : '');
-
-export function normalizeModels(rows) {
-  if (!Array.isArray(rows) || rows.length > 1000) throw new Error('Invalid model catalog');
-  const seen = new Set();
-  return rows.flatMap(row => {
-    const id = row?.id ?? row?.model;
-    if (typeof id !== 'string' || !id.trim() || id.length > 200 || /[\x00-\x20\x7f]/.test(id) || seen.has(id)) return [];
-    seen.add(id);
-    return [{ model: id, label: clean(row.displayName ?? row.label) || id }];
-  });
+// 'zai/glm-5.3' → { provider: 'zai', model: 'glm-5.3' }; a bare id → null.
+export function splitKey(key) {
+  const m = typeof key === 'string' ? KEY.exec(key) : null;
+  return m ? { provider: m[1], model: m[2] } : null;
 }
 
-export async function fetchCatalog(apiKey, signal) {
-  const response = await fetch(CATALOG_URL, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-    redirect: 'error',
-    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
-  });
-  if (!response.ok) throw new Error(`DeepSeek /models returned HTTP ${response.status}`);
-  const reader = response.body.getReader();
-  const chunks = [];
-  let bytes = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.length;
-      if (bytes > 1024 * 1024) throw new Error('Catalog too large');
-      chunks.push(value);
-    }
-  } finally { await reader.cancel().catch(() => {}); }
-  return normalizeModels(JSON.parse(Buffer.concat(chunks).toString('utf8')).data);
+// Vendors quote windows in both bases (131072 vs 1000000); pick the one that lands on a round number.
+export const contextK = n => Math.round(n / (n % 1024 === 0 ? 1024 : 1000));
+
+// Reasoning effort the parent gets when it names none: "high" whenever the
+// model offers it, else the model's own default, else its strongest level.
+export const DEFAULT_EFFORT = 'high';
+const EFFORT_RANK = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'off'];
+const fmtContext = n => (n ? ` (${contextK(n)}k context)` : '');
+
+function describeCandidates(models) {
+  return models.map(m => `  - ${m.key} — ${m.name}${fmtContext(m.contextWindow)}`).join('\n');
 }
 
-async function atomicWrite(file, content) {
-  await mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${randomUUID()}.tmp`;
-  await writeFile(tmp, content, { mode: 0o600 });
-  await rename(tmp, file);
+// Thrown by requireChoice() when the parent must ask the user first.
+export class AskFirstError extends Error {
+  constructor(candidates) {
+    super(
+      `MODEL REQUIRED — ${candidates.length} models are enabled on the DeepSeek Harness and this call did not set \`model\`.\n`
+      + 'Ask the USER which model to use (Claude Code: AskUserQuestion; Codex: ask in chat), then call again with `model` set to exactly one of:\n'
+      + describeCandidates(candidates) + '\n'
+      + 'Do not pick one yourself. deepseek_models returns the same list with details.',
+    );
+    this.name = 'AskFirstError';
+    this.candidates = candidates;
+  }
 }
 
-export class Catalog {
-  constructor(home) {
+// The Models page derives a key name for routes that name none.
+const derivedKeyRef = provider => `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}_API_KEY`;
+
+function walk(value, segments) {
+  let cur = value;
+  for (const s of segments) {
+    if (!cur || typeof cur !== 'object') return undefined;
+    cur = cur[s];
+  }
+  return cur;
+}
+
+export class ModelDirectory {
+  constructor(ctx, home, { live } = {}) {
+    this.ctx = ctx;
+    this.live = live;
     this.file = path.join(home, 'model-catalog.json');
-    this.models = [];
-    this.checkedAt = null;
-    this.stale = true;
-    this.message = '';
+    this.enabled = {};
+    this.cache = null;
+    this.cachedAt = 0;
     this.pending = null;
-    this.lastRefresh = 0;
   }
 
-  // A cache we wrote ourselves is still revalidated: only known fields survive.
+  // v2: { version: 2, enabled: { "provider/model": bool } }. A v1 file (per-
+  // model rows of the old DeepSeek-only catalog) is migrated in place.
   async load() {
     try {
       const raw = JSON.parse(await readFile(this.file, 'utf8'));
-      const listed = new Map((raw.models || []).map(m => [m.model, m.listed !== false]));
-      const enabled = new Map((raw.models || []).map(m => [m.model, m.enabled !== false]));
-      this.models = normalizeModels(raw.models || []).map(m => ({
-        ...m,
-        listed: listed.get(m.model) !== false,
-        enabled: enabled.get(m.model) !== false,
-      }));
-      this.checkedAt = typeof raw.checkedAt === 'string' ? raw.checkedAt : null;
-      this.stale = true;
-      this.message = 'Loaded from cache; not yet verified against the API in this session.';
-    } catch {
-      this.models = [];
-      this.message = '';
-    }
-    if (!this.models.length) {
-      this.models = SEED.map(m => ({ ...m }));
-      this.stale = true;
-      this.message = 'No cache and the API has not been probed yet — using the fallback list.';
-    }
-    return this.snapshot();
-  }
-
-  snapshot() {
-    return {
-      provider: PROVIDER,
-      models: this.models.map(m => ({ ...m })),
-      defaultModel: this.defaultModel(),
-      catalogCheckedAt: this.checkedAt,
-      catalogStale: this.stale,
-      message: this.message,
-    };
-  }
-
-  listedModels() { return this.models.filter(m => m.listed); }
-
-  // Usable = still served by the API AND not switched off by the user.
-  usableModels() { return this.models.filter(m => m.listed && m.enabled !== false); }
-
-  defaultModel() {
-    const usable = this.usableModels();
-    for (const id of PREFERRED) if (usable.some(m => m.model === id)) return id;
-    return usable[0]?.model ?? this.listedModels()[0]?.model ?? this.models[0]?.model ?? SEED[0].model;
-  }
-
-  async setEnabled(id, enabled) {
-    const hit = this.models.find(m => m.model === id);
-    if (!hit) throw new Error(`No such model "${id}".`);
-    if (!enabled && this.usableModels().filter(m => m.model !== id).length === 0) {
-      throw new Error('At least one model must remain enabled.');
-    }
-    hit.enabled = enabled;
-    await this.persist();
-    return this.snapshot();
+      if (raw && raw.version === 2 && raw.enabled && typeof raw.enabled === 'object') {
+        for (const [key, on] of Object.entries(raw.enabled)) if (splitKey(key)) this.enabled[key] = on === true;
+      } else if (Array.isArray(raw?.models)) {
+        for (const m of raw.models) if (typeof m?.model === 'string') this.enabled[keyOf(DEEPSEEK, m.model)] = m.enabled !== false;
+        await this.persist();
+      }
+    } catch { /* first run: everything off until the user switches a model on */ }
   }
 
   async persist() {
-    await atomicWrite(this.file, JSON.stringify({ checkedAt: this.checkedAt, models: this.models }, null, 2));
+    await atomicWrite(this.file, JSON.stringify({ version: 2, enabled: this.enabled }, null, 2));
   }
 
-  // Unknown ids are rejected; retired ids are allowed but reported, because the
-  // adapter still accepts unlisted ids and DeepSeek keeps them aliased for a while.
-  resolve(requested) {
-    if (requested === undefined || requested === null || requested === '') {
-      return { model: this.defaultModel(), warning: null };
-    }
-    if (typeof requested !== 'string') throw new Error('model must be a string.');
-    const hit = this.models.find(m => m.model === requested);
-    if (!hit) {
-      const available = this.usableModels().map(m => m.model).join(', ') || '(none)';
-      throw new Error(`Model "${requested}" is not in DeepSeek's current catalog. Available: ${available}. Call deepseek_models for the latest list.`);
-    }
-    if (hit.enabled === false) {
-      throw new Error(`Model "${hit.model}" is switched off in the DSH UI (Settings → Sub-agent). Enabled: ${this.usableModels().map(m => m.model).join(', ') || '(none)'}.`);
-    }
-    return {
-      model: hit.model,
-      warning: hit.listed ? null : `Model "${hit.model}" is no longer listed by the DeepSeek API (likely retired, temporarily aliased). Consider switching to: ${this.defaultModel()}.`,
-    };
-  }
+  invalidate() { this.cache = null; }
 
-  async refresh(resolveKey, { force = false, signal } = {}) {
-    if (this.pending) return this.pending;
-    if (!force && Date.now() - this.lastRefresh < 60000) return this.snapshot();
-    this.pending = this.#refresh(resolveKey, signal).finally(() => {
-      this.pending = null;
-      this.lastRefresh = Date.now();
-    });
+  async snapshot() {
+    if (this.cache && Date.now() - this.cachedAt < CACHE_MS) return this.cache;
+    if (!this.pending) {
+      this.pending = this.#build().then(snap => {
+        this.cache = snap;
+        this.cachedAt = Date.now();
+        return snap;
+      }).finally(() => { this.pending = null; });
+    }
     return this.pending;
   }
 
-  async #refresh(resolveKey, signal) {
-    let apiKey;
-    try { apiKey = await resolveKey(); } catch { apiKey = null; }
-    if (!apiKey) {
-      this.stale = true;
-      this.message = 'No DeepSeek API key configured. Open the DSH UI → Settings → Models to add one.';
-      return this.snapshot();
-    }
-    try {
-      const fresh = await fetchCatalog(apiKey, signal);
-      const seen = new Set(fresh.map(m => m.model));
-      // The user's on/off choice is theirs, not the API's, so it survives a refresh.
-      const wasEnabled = new Map(this.models.map(m => [m.model, m.enabled !== false]));
-      // Anything we knew about that the API no longer serves is retired, not deleted:
-      // keeping it lets us warn precisely instead of failing with "unknown model".
-      const retired = this.models.filter(m => !seen.has(m.model)).map(m => ({ ...m, listed: false }));
-      this.models = [
-        ...fresh.map(m => ({ ...m, listed: true, enabled: wasEnabled.get(m.model) !== false })),
-        ...retired,
-      ];
-      this.checkedAt = new Date().toISOString();
-      this.stale = false;
-      this.message = '';
-      await this.persist().catch(() => {
-        this.message = 'Could not write the model cache; the next start will probe again.';
+  async #build() {
+    const { ctx } = this;
+    const active = ctx.llm.listProviders();
+    active.sort((a, b) => (a.id === DEEPSEEK ? -1 : b.id === DEEPSEEK ? 1 : 0));
+    const directory = new Map(ctx.llm.listConfigurableProviders().map(e => [e.provider, e]));
+    const providers = [];
+    for (const route of active) {
+      const entry = directory.get(route.id);
+      let apiKeyEnv;
+      if (entry) {
+        const section = ctx.settings?.get?.(entry.settingsNs);
+        const profile = walk(section, entry.settingsPath);
+        const named = profile && typeof profile === 'object' ? profile.apiKeyEnv : undefined;
+        apiKeyEnv = typeof named === 'string' && named.trim()
+          ? named.trim()
+          : entry.settingsNs === 'llm-deepseek' ? 'DEEPSEEK_API_KEY' : derivedKeyRef(route.id);
+      }
+      let credential = null;
+      if (apiKeyEnv) {
+        try {
+          const info = await ctx.credentials.describe(credentialRef(apiKeyEnv));
+          credential = { configured: info?.configured === true, ...(info?.source ? { source: info.source } : {}) };
+        } catch { credential = { configured: false }; }
+      }
+      const usable = !apiKeyEnv || credential?.configured === true;
+      let error = entry?.error ?? null;
+      let models = [];
+      try {
+        const listed = await ctx.llm.listModels(route.id);
+        models = await Promise.all(listed.map(async m => {
+          let contextWindow = null;
+          let reasoning = null;
+          try {
+            const info = await ctx.llm.resolveModelInfo(route.id, m.id);
+            contextWindow = info?.context?.contextWindow ?? null;
+            const efforts = (info?.reasoning?.efforts ?? []).map(e => String(e.id));
+            if (efforts.length) reasoning = { efforts, defaultEffort: info.reasoning.defaultEffort ? String(info.reasoning.defaultEffort) : null };
+          } catch { /* metadata only */ }
+          const key = keyOf(route.id, m.id);
+          return {
+            key,
+            id: m.id,
+            name: m.name || m.id,
+            contextWindow,
+            reasoning,
+            enabled: this.enabled[key] === true,
+            listed: route.id === DEEPSEEK && this.live ? this.live.isListed(m.id) : null,
+          };
+        }));
+      } catch (e) {
+        error = error ?? String(e?.message || e);
+      }
+      providers.push({
+        id: route.id,
+        name: entry?.displayName || route.name || route.id,
+        apiKeyEnv: apiKeyEnv ?? null,
+        credential,
+        usable,
+        error,
+        models,
       });
-    } catch (error) {
-      this.stale = true;
-      this.message = `Could not fetch the model list (${error.message}). Using cached data.`;
     }
+    const enabled = providers.filter(p => p.usable).flatMap(p => p.models.filter(m => m.enabled).map(m => m.key));
+    return {
+      askFirst: enabled.length >= 2,
+      enabled,
+      providers,
+      deepseekLive: this.live ? (({ models, ...rest }) => rest)(this.live.snapshot()) : null,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  // Flat list of models the parent may run on: enabled AND provider usable.
+  async usableModels() {
+    const snap = await this.snapshot();
+    return snap.providers.filter(p => p.usable).flatMap(p => p.models.filter(m => m.enabled).map(m => ({ ...m, provider: p.id })));
+  }
+
+  async requireChoice() {
+    const usable = await this.usableModels();
+    if (!usable.length) throw new Error('No model is enabled for delegation. Open the DSH UI → Settings → Sub-agent and switch one on.');
+    if (usable.length === 1) return this.#pick(usable[0]);
+    throw new AskFirstError(usable);
+  }
+
+  // `implicit` is a continuation reusing the model its session started on: the
+  // delegation switch is ignored (with a warning) but the provider must still be
+  // active and have a key.
+  async resolve(requested, { implicit = false } = {}) {
+    if (typeof requested !== 'string' || !requested.trim()) throw new Error('model must be a non-empty string; call deepseek_models for the list.');
+    const snap = await this.snapshot();
+    const activeIds = snap.providers.map(p => p.id).join(', ') || '(none)';
+    const enabledList = snap.enabled.join(', ') || '(none)';
+    const split = splitKey(requested.trim());
+    let provider;
+    let hit;
+    if (split) {
+      provider = snap.providers.find(p => p.id === split.provider);
+      if (!provider) throw new Error(`Provider "${split.provider}" is not active on the DeepSeek Harness (Settings → Models). Active providers: ${activeIds}.`);
+      hit = provider.models.find(m => m.id === split.model);
+      if (!hit) throw new Error(`Model "${requested}" is not served by provider "${provider.id}". Enabled models: ${enabledList}. Call deepseek_models for the full list.`);
+    } else {
+      const candidates = snap.providers.flatMap(p => p.models.filter(m => m.id === requested.trim()).map(m => ({ p, m })));
+      if (!candidates.length) throw new Error(`Model "${requested}" is not known to any active provider. Enabled models: ${enabledList}. Use "provider/model" as listed by deepseek_models.`);
+      if (candidates.length > 1) throw new Error(`Model id "${requested}" is ambiguous: use one of ${candidates.map(c => c.m.key).join(', ')}.`);
+      ({ p: provider, m: hit } = candidates[0]);
+    }
+    if (!provider.usable) throw new Error(`Provider "${provider.id}" has no API key configured (DSH UI → Settings → Models). Enabled models: ${enabledList}.`);
+    if (!hit.enabled && !implicit) throw new Error(`Model "${hit.key}" is switched off in the DSH UI (Settings → Sub-agent). Enabled: ${enabledList}.`);
+    const warnings = [];
+    if (!hit.enabled && implicit) warnings.push(`model ${hit.key} is switched off for new delegations; continuing on it because the session started with it`);
+    if (hit.listed === false) warnings.push(`model ${hit.id} is no longer listed by the DeepSeek API (likely retired, temporarily aliased)`);
+    return this.#pick({ ...hit, provider: provider.id }, warnings.join('; ') || null);
+  }
+
+  #pick(m, warning = null) {
+    return { provider: m.provider, model: m.id, key: m.key, name: m.name, contextWindow: m.contextWindow ?? null, reasoning: m.reasoning ?? null, warning };
+  }
+
+  // Validates a requested reasoning effort against what the picked model
+  // offers, or chooses the default. Returns { effort, warning }; effort is
+  // null for a model without selectable levels.
+  static resolveEffort(picked, requested) {
+    const efforts = picked.reasoning?.efforts ?? [];
+    const has = id => efforts.includes(id);
+    if (requested !== undefined && requested !== null && requested !== '') {
+      if (typeof requested !== 'string') throw new Error('reasoningEffort must be a string.');
+      const want = requested.trim().toLowerCase();
+      if (!efforts.length) return { effort: null, warning: `model ${picked.key} has no selectable reasoning effort; "${want}" ignored` };
+      if (!has(want)) throw new Error(`Reasoning effort "${want}" is not offered by ${picked.key}. Available: ${efforts.join(', ')}.`);
+      return { effort: want, warning: null };
+    }
+    if (!efforts.length) return { effort: null, warning: null };
+    if (has(DEFAULT_EFFORT)) return { effort: DEFAULT_EFFORT, warning: null };
+    if (picked.reasoning.defaultEffort && has(picked.reasoning.defaultEffort)) return { effort: picked.reasoning.defaultEffort, warning: null };
+    return { effort: EFFORT_RANK.find(has) ?? efforts[0], warning: null };
+  }
+
+  async setEnabled(key, enabled) {
+    const split = splitKey(key);
+    if (!split) throw new Error('key must be "provider/model".');
+    const snap = await this.snapshot();
+    const provider = snap.providers.find(p => p.id === split.provider);
+    const hit = provider?.models.find(m => m.id === split.model);
+    if (!hit) throw new Error(`No such model "${key}".`);
+    if (enabled && !provider.usable) throw new Error(`Provider "${provider.id}" has no API key configured; add one under Settings → Models first.`);
+    this.enabled[key] = enabled === true;
+    await this.persist();
+    this.invalidate();
     return this.snapshot();
   }
-}
-
-// Used by bootstrap.mjs, which runs outside the harness and has no ctx.credentials.
-export async function readCachedModels(home) {
-  const catalog = new Catalog(home);
-  await catalog.load();
-  return catalog;
 }

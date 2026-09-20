@@ -8,13 +8,15 @@ import path from 'node:path';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { Catalog } from './models.mjs';
+import { ModelDirectory, AskFirstError, splitKey, keyOf, DEEPSEEK } from './models.mjs';
+import { DeepSeekLive } from './deepseek-live.mjs';
+import { scanSkills, summarizeSkills, resolveSkills, skillRootsSummary } from './skills.mjs';
 import { Delegator, readUsage, usageDelta, TOOL_CALL_BOUNDS, DEFAULT_LIMITS } from './delegate.mjs';
 import { validateWorkspace, gitStatus, diffStatus } from './workspace.mjs';
 import { home, projectRoot } from './bootstrap.mjs';
 
 export const name = 'deepseek-sub-mcp';
-export const inject = ['webServer', 'credentials', 'agents', 'tools', 'connection', 'workspaceRegistry', 'sessionTitle'];
+export const inject = ['webServer', 'credentials', 'agents', 'tools', 'connection', 'workspaceRegistry', 'sessionTitle', 'llm', 'settings', 'skills'];
 
 const ROUTE = '/mcp';
 // Fragment the launcher appends so the client plugin opens our Settings section.
@@ -85,14 +87,20 @@ class History {
       const raw = JSON.parse(await readFile(this.file, 'utf8'));
       if (Array.isArray(raw)) this.entries = raw.slice(-this.limit);
     } catch { /* first run */ }
-    let orphaned = false;
+    let changed = false;
     for (const entry of this.entries) {
+      // Records from before the multi-provider directory carry a bare DeepSeek id.
+      if (typeof entry.model === 'string' && !splitKey(entry.model)) {
+        entry.model = keyOf(DEEPSEEK, entry.model);
+        changed = true;
+      }
+      if (!entry.provider && typeof entry.model === 'string') entry.provider = splitKey(entry.model)?.provider;
       if (entry.status !== 'running') continue;
       entry.status = 'interrupted';
       entry.reason = 'the harness restarted while the run was in flight';
-      orphaned = true;
+      changed = true;
     }
-    if (orphaned) await this.persist();
+    if (changed) await this.persist();
   }
   async start(entry) {
     const record = { id: randomUUID(), ...entry, status: 'running' };
@@ -182,7 +190,8 @@ function requireSessionId(value) {
 
 export async function apply(ctx) {
   const token = await ensureToken();
-  const catalog = new Catalog(home);
+  const live = new DeepSeekLive(home);
+  const directory = new ModelDirectory(ctx, home, { live });
   const delegator = new Delegator(ctx);
   const history = new History(path.join(home, 'delegations.json'));
   const resolveKey = async () => (await ctx.credentials.resolve('DEEPSEEK_API_KEY'))?.value ?? null;
@@ -190,10 +199,17 @@ export async function apply(ctx) {
   // run that is still in flight (background, or one the parent gave up on).
   const pending = new Map();
 
-  await catalog.load();
+  await live.load();
+  await directory.load();
   await history.load();
-  // Warm the catalog from the live API without blocking boot.
-  catalog.refresh(resolveKey).catch(() => {});
+  // Warm the DeepSeek probe from the live API without blocking boot; the
+  // directory itself is built lazily from the harness on first use.
+  live.refresh(resolveKey).then(() => directory.invalidate()).catch(() => {});
+  // Providers, their models and their keys are edited in the harness's own
+  // Settings dialog; drop our 30 s cache the moment any of that changes.
+  ctx.on('llm/adapters-updated', () => directory.invalidate());
+  ctx.on('settings/updated', ns => { if (ns === 'llm-pi-ai' || ns === 'llm-deepseek') directory.invalidate(); });
+  ctx.on('credentials/reference-updated', () => directory.invalidate());
   // Earlier versions created the workspace but never attached the session to
   // it, so their runs sit under "Ungrouped" in the sidebar. Adopt them once
   // the harness is up; attaching is idempotent.
@@ -204,11 +220,22 @@ export async function apply(ctx) {
 
   // One delegation turn: a fresh session, or a follow-up turn on a persisted
   // one (`resume` is that session's latest history entry).
-  async function startRun({ role, task, workspace, model, timeoutSec, allowDirty, background, maxToolCalls, resume }, extra) {
+  async function startRun({ role, task, workspace, model, reasoningEffort, skills, timeoutSec, allowDirty, background, maxToolCalls, resume }, extra) {
     if (typeof task !== 'string' || !task.trim()) throw new Error('task must not be empty.');
     if (task.length > 32000) throw new Error('task is limited to 32,000 characters.');
+    // Model first: the ask-first refusal must fire before anything is touched
+    // or recorded. A continuation without `model` stays on its session's model.
+    const picked = resume
+      ? await directory.resolve(model ?? resume.model, { implicit: model === undefined || model === null || model === '' })
+      : (model !== undefined && model !== null && model !== '')
+        ? await directory.resolve(model)
+        : await directory.requireChoice();
+    // Effort: what the parent asked for, else (on a continuation) what the
+    // session ran with last time, else the directory's default ("high").
+    const effortWanted = reasoningEffort ?? (resume ? resume.effort ?? undefined : undefined);
+    const chosen = ModelDirectory.resolveEffort(picked, effortWanted);
     const ws = await validateWorkspace(workspace, home);
-    const picked = catalog.resolve(model);
+    const attached = await resolveSkills(skills, { workspace: ws });
 
     const seconds = Math.min(Math.max(Number(timeoutSec) || DEFAULT_TIMEOUT_SEC, 30), 3600);
     const budget = maxToolCalls === undefined
@@ -229,19 +256,24 @@ export async function apply(ctx) {
 
     const sessionId = resume ? resume.sessionId : randomUUID();
     const turn = resume ? (resume.turn ?? 1) + 1 : 1;
-    const header = [`model: ${picked.model}`, `role: ${role}`, `workspace: ${ws}`, `session: ${sessionId}${turn > 1 ? ` (turn ${turn})` : ''}`];
-    if (picked.warning) header.push(`WARNING: ${picked.warning}`);
+    const skillNames = attached.map(s => s.name);
+    const header = [`model: ${picked.key}`, `effort: ${chosen.effort ?? 'n/a'}`, `role: ${role}`, `workspace: ${ws}`, `session: ${sessionId}${turn > 1 ? ` (turn ${turn})` : ''}`];
+    if (skillNames.length) header.push(`skills: ${skillNames.join(', ')}`);
+    for (const w of [picked.warning, chosen.warning]) if (w) header.push(`WARNING: ${w}`);
 
     const startedAt = Date.now();
     const record = await history.start({
       time: new Date(startedAt).toISOString(),
       role,
-      model: picked.model,
+      model: picked.key,
+      provider: picked.provider,
+      effort: chosen.effort,
       workspace: ws,
       task: task.slice(0, 160),
       sessionId,
       turn,
       background: Boolean(background),
+      ...(skillNames.length ? { skills: skillNames } : {}),
     });
     const usageBefore = resume ? await readUsage(home, sessionId, { waitMs: 0 }) : null;
 
@@ -266,7 +298,10 @@ export async function apply(ctx) {
           role,
           task,
           workspace: ws,
+          provider: picked.provider,
           model: picked.model,
+          reasoningEffort: chosen.effort ?? undefined,
+          skills: attached,
           signals: { timeout, 'client-disconnect': client },
           title: sessionTitleFor(role, ws, task),
           maxToolCalls: budget,
@@ -286,7 +321,7 @@ export async function apply(ctx) {
         const durationMs = Date.now() - startedAt;
         const status = failed ? result.stopReason : 'completed';
         // A turn run on the agent the DSH UI holds uses that agent's model.
-        const usedModel = result.model ?? picked.model;
+        const usedModel = result.model ?? picked.key;
         header[0] = `model: ${usedModel}`;
         const body = [
           header.join(' | '),
@@ -294,7 +329,7 @@ export async function apply(ctx) {
           describeUsage(usage),
           ...(result.diagnostic ? [`diagnostic: ${result.diagnostic}`] : []),
           ...(failed && !result.diagnostic
-            ? ['hint: check the DeepSeek API key in the GUI (Settings → Models) and your account quota.']
+            ? [`hint: check the API key of provider "${splitKey(usedModel)?.provider ?? picked.provider}" in the GUI (Settings → Models) and your account quota.`]
             : []),
           ...(failed ? [`To pick up where it stopped: deepseek_continue({ sessionId: "${sessionId}", message: "..." })`] : []),
           describeChanges(before, after),
@@ -304,6 +339,7 @@ export async function apply(ctx) {
         await history.finish(record, {
           status,
           model: usedModel,
+          provider: splitKey(usedModel)?.provider ?? picked.provider,
           reason: result.diagnostic || undefined,
           durationMs,
           toolCalls: result.toolCalls,
@@ -311,7 +347,8 @@ export async function apply(ctx) {
           usage,
         });
         await saveResult(sessionId, {
-          sessionId, turn, time: record.time, role, model: usedModel, workspace: ws, task: task.slice(0, 160),
+          sessionId, turn, time: record.time, role, model: usedModel, provider: splitKey(usedModel)?.provider ?? picked.provider,
+          effort: chosen.effort, skills: skillNames, workspace: ws, task: task.slice(0, 160),
           status, stopReason: result.stopReason, abortReason: result.abortReason, diagnostic: result.diagnostic,
           durationMs, toolCalls: result.toolCalls, changedFiles: changed ?? null, usage, text: result.text, body,
         }).catch(() => {});
@@ -326,7 +363,8 @@ export async function apply(ctx) {
         const body = [header.join(' | '), `FAILED: ${message}`, describeChanges(before, after)].join('\n');
         await history.finish(record, { status: 'failed', error: message.slice(0, 300), durationMs, changedFiles: changed?.length ?? null });
         await saveResult(sessionId, {
-          sessionId, turn, time: record.time, role, model: picked.model, workspace: ws, task: task.slice(0, 160),
+          sessionId, turn, time: record.time, role, model: picked.key, provider: picked.provider, effort: chosen.effort, skills: skillNames,
+          workspace: ws, task: task.slice(0, 160),
           status: 'failed', error: message, durationMs, changedFiles: changed ?? null, text: '', body,
         }).catch(() => {});
         return { body, failed: true };
@@ -350,8 +388,15 @@ export async function apply(ctx) {
     return text(body, failed);
   }
 
-  function delegate(role, args, extra) {
-    return startRun({ role, ...args }, extra);
+  // The ask-first refusal is a tool result the parent must act on (ask the
+  // user, call again), not a protocol error.
+  async function delegate(role, args, extra) {
+    try {
+      return await startRun({ role, ...args }, extra);
+    } catch (error) {
+      if (error instanceof AskFirstError) return text(error.message, true);
+      throw error;
+    }
   }
 
   // The cross-run view: live runs first, then the newest record per session.
@@ -373,8 +418,10 @@ export async function apply(ctx) {
       const origin = first.get(run.sessionId);
       rows.push({
         ...s,
+        provider: splitKey(s.model)?.provider ?? null,
         task: origin?.task ?? run.task.slice(0, 160),
         ...(origin && origin !== entry ? { lastMessage: entry?.task } : {}),
+        ...(entry?.skills?.length ? { skills: entry.skills } : {}),
         time: entry?.time ?? new Date(run.startedAt).toISOString(),
         turns: turns.get(run.sessionId) ?? 1,
         background: entry?.background ?? false,
@@ -392,9 +439,12 @@ export async function apply(ctx) {
         reason: e.reason ?? e.error ?? undefined,
         role: e.role,
         model: e.model,
+        provider: e.provider ?? splitKey(e.model)?.provider ?? null,
+        effort: e.effort ?? null,
         workspace: e.workspace,
         task: origin.task,
         ...(origin !== e ? { lastMessage: e.task } : {}),
+        ...(e.skills?.length ? { skills: e.skills } : {}),
         time: e.time,
         turn: e.turn ?? 1,
         turns: turns.get(e.sessionId),
@@ -414,26 +464,56 @@ export async function apply(ctx) {
 
   function buildServer() {
     const server = new McpServer(
-      { name: 'dsh-deepseek-subagent', version: '1.1.0' },
+      { name: 'dsh-deepseek-subagent', version: '1.2.0' },
       { capabilities: { tools: {} } },
     );
 
     server.registerTool('deepseek_models', {
-      title: 'DeepSeek model list',
+      title: 'Models available on the DeepSeek Harness',
       description:
-        'Lists the DeepSeek models currently available, fetched live from the DeepSeek API (not a hardcoded list). '
-        + 'Call this before choosing the `model` parameter for the other deepseek tools. '
-        + 'A model with listed=false has left the API catalog (likely retired).',
+        'Lists every provider active on the DeepSeek Harness (DeepSeek plus any provider configured under Settings → Models, e.g. GLM via a "zai" route) '
+        + 'with its models, whether its API key is configured, and which models are switched on for delegation. '
+        + '`enabled` is the list of usable "provider/model" keys; when it holds more than one entry (`askFirst: true`) you must ask the user which one to use '
+        + 'and pass it as `model` to deepseek_research / deepseek_code. For deepseek-official, listed=false means the DeepSeek API no longer serves that id.',
       inputSchema: {
-        refresh: z.boolean().optional().describe('Force a live API probe instead of using the cache. Throttled to once per 60 seconds.'),
+        refresh: z.boolean().optional().describe('Re-probe the DeepSeek API and rebuild the directory instead of using the cache. Throttled to once per 60 seconds.'),
       },
     }, async ({ refresh }, extra) => {
-      const snapshot = await catalog.refresh(resolveKey, { force: refresh === true, signal: extra?.signal });
-      return json(snapshot);
+      if (refresh === true) {
+        await live.refresh(resolveKey, { force: true, signal: extra?.signal });
+        directory.invalidate();
+      }
+      return json(await directory.snapshot());
+    });
+
+    server.registerTool('deepseek_skills', {
+      title: 'Skills that can be attached to a delegation',
+      description:
+        'Lists the parent agent\'s skills (Claude Code / Codex SKILL.md files found in the workspace, ~/.claude, ~/.codex, ~/.agents and installed plugins) '
+        + 'that can be attached to a delegation by name through the `skills` parameter. Use it when you are unsure of a skill\'s exact name.',
+      inputSchema: {
+        workspace: z.string().optional().describe('Absolute project path, to include its .claude/skills and .agents/skills.'),
+        refresh: z.boolean().optional().describe('Rescan the directories instead of using the 30 s cache.'),
+      },
+    }, async ({ workspace, refresh }) => {
+      const ws = workspace ? await validateWorkspace(workspace, home) : undefined;
+      return json(summarizeSkills(await scanSkills({ workspace: ws, force: refresh === true })));
     });
 
     const runOptions = {
-      model: z.string().optional().describe('DeepSeek model id. Leave empty for the default. See deepseek_models.'),
+      model: z.string().optional().describe(
+        'Model as "provider/model" (e.g. deepseek-official/deepseek-flash, zai/glm-5.3) from deepseek_models. '
+        + 'A bare id is accepted only when it is unique across providers. '
+        + 'REQUIRED when more than one model is enabled: ask the user which one to use first — the call is refused otherwise.',
+      ),
+      reasoningEffort: z.string().optional().describe(
+        'How hard the model thinks. Default "high". Use "max" for HARD tasks: subtle bugs, cross-cutting refactors, anything where a wrong answer is expensive. '
+        + '"low"/"off" only for trivial lookups. Levels depend on the model (deepseek_models lists them per model, e.g. off, low, high, max).',
+      ),
+      skills: z.array(z.string().min(1)).max(8).optional().describe(
+        'Names of YOUR skills that are relevant to this task (see deepseek_skills), e.g. ["find-skills"]. '
+        + 'They are registered in the agent\'s session and it loads them with its `skill` tool; pick 1–3 instead of pasting their content into `task`.',
+      ),
       timeoutSec: z.number().int().min(30).max(3600).optional().describe(`Time limit in seconds, default ${DEFAULT_TIMEOUT_SEC}.`),
       maxToolCalls: z.number().int().min(TOOL_CALL_BOUNDS.min).max(TOOL_CALL_BOUNDS.max).optional()
         .describe(`Tool call budget for the agent, default ${DEFAULT_LIMITS.maxToolCalls}. Raise it for tasks touching many files.`),
@@ -441,24 +521,24 @@ export async function apply(ctx) {
         .describe('Return immediately with the sessionId and let the agent run on. Read the report later with deepseek_result. Use for anything that may take more than a few minutes.'),
     };
     const shared = {
-      task: z.string().describe('A self-contained task with full context. The DeepSeek agent cannot see your conversation.'),
+      task: z.string().describe('A self-contained task with full context. The agent cannot see your conversation.'),
       workspace: z.string().describe('Absolute path to the project directory. Usually your current working directory.'),
       ...runOptions,
     };
 
     server.registerTool('deepseek_research', {
-      title: 'DeepSeek read & analyse (read-only)',
+      title: 'DeepSeek Harness read & analyse (read-only)',
       description:
-        'Delegate an ANALYSIS task to a local DeepSeek agent. The agent can only read files (read/glob/grep); '
+        'Delegate an ANALYSIS task to a local DeepSeek Harness agent (any configured provider/model). The agent can only read files (read/glob/grep); '
         + 'it does NOT edit files and does NOT run commands. Use it to review code, find bugs, explain a module, or survey a codebase. '
         + 'The result names the sessionId; deepseek_continue can ask that same agent follow-up questions.',
       inputSchema: shared,
     }, (args, extra) => delegate('research', args, extra));
 
     server.registerTool('deepseek_code', {
-      title: 'DeepSeek edit code (read & write)',
+      title: 'DeepSeek Harness edit code (read & write)',
       description:
-        'Delegate a CODE-CHANGE task to a local DeepSeek agent. The agent can read, write, edit files and run commands '
+        'Delegate a CODE-CHANGE task to a local DeepSeek Harness agent (any configured provider/model). The agent can read, write, edit files and run commands '
         + 'inside the workspace. Refuses to run on a dirty git tree (unless allowDirty=true) so a rollback point always exists. '
         + 'The result always includes the list of changed files and the sessionId, which deepseek_continue can resume if the run stopped early.',
       inputSchema: {
@@ -514,7 +594,8 @@ export async function apply(ctx) {
       description:
         'Sends a follow-up turn to a FINISHED delegation and returns its new report. The agent resumes with everything it already read and did, '
         + 'so this is the cheap way to say "carry on where you stopped", "now also handle X", or to ask a research agent a follow-up question. '
-        + 'The tree is usually dirty from the previous turn, so allowDirty defaults to true here.',
+        + 'The tree is usually dirty from the previous turn, so allowDirty defaults to true here. '
+        + 'Without `model` the turn runs on the model the session started with (never asks); pass `model` to switch. Without `reasoningEffort` it keeps the previous effort of the session.',
       inputSchema: {
         sessionId: z.string().describe('Session id from a result header or deepseek_sessions.'),
         message: z.string().describe('The follow-up instruction. Refer to the previous work; do not repeat the whole original task.'),
@@ -532,7 +613,6 @@ export async function apply(ctx) {
         role: role ?? entry.role,
         task: message,
         workspace: entry.workspace,
-        model: options.model ?? entry.model,
         allowDirty: allowDirty ?? true,
         resume: entry,
       }, extra);
@@ -741,6 +821,9 @@ export async function apply(ctx) {
         role: r.role,
         turn: r.turn ?? 1,
         model: r.model,
+        provider: r.provider ?? splitKey(r.model)?.provider ?? null,
+        effort: r.effort ?? null,
+        skills: r.skills ?? [],
         status: r.status,
         reason: r.reason ?? r.error ?? null,
         durationMs: r.status === 'running' ? Date.now() - Date.parse(r.time) : (r.durationMs ?? null),
@@ -762,15 +845,21 @@ export async function apply(ctx) {
     await history.settle(home);
     const keyConfigured = await resolveKey().then(Boolean).catch(() => false);
     // Never block the panel on the network: hand back what we have and let the
-    // (throttled) probe update the cache for the next poll.
-    if (keyConfigured) catalog.refresh(resolveKey).catch(() => {});
+    // (throttled) DeepSeek probe update its cache for the next poll.
+    if (keyConfigured) live.refresh(resolveKey).then(s => { if (!s.stale) directory.invalidate(); }).catch(() => {});
+    const [catalog, skills] = await Promise.all([
+      directory.snapshot(),
+      skillRootsSummary().catch(() => ({ total: 0, roots: [] })),
+    ]);
     return {
       now: new Date().toISOString(),
       port: ctx.webServer.port,
       mcpUrl: mcpUrl(),
       home,
       key: { configured: keyConfigured },
-      catalog: catalog.snapshot(),
+      catalog,
+      providers: { usable: catalog.providers.filter(p => p.usable).length, total: catalog.providers.length },
+      skills,
       agents: {
         claude: { cli: cliCandidates('claude')[0] ?? null, guidance: guidanceDest.claude(), guidanceInstalled: guidanceInstalled('claude') },
         codex: { cli: cliCandidates('codex')[0] ?? null, guidance: guidanceDest.codex(), guidanceInstalled: guidanceInstalled('codex') },
@@ -834,11 +923,13 @@ export async function apply(ctx) {
           return json(200, await runVerify(target));
         }
         if (req.method === 'POST' && route === '/model') {
-          const snapshot = await catalog.setEnabled(body.model, body.enabled === true);
+          const snapshot = await directory.setEnabled(body.key ?? body.model, body.enabled === true);
           return json(200, { catalog: snapshot });
         }
         if (req.method === 'POST' && route === '/models/refresh') {
-          return json(200, { catalog: await catalog.refresh(resolveKey, { force: true }) });
+          await live.refresh(resolveKey, { force: true });
+          directory.invalidate();
+          return json(200, { catalog: await directory.snapshot() });
         }
         if (req.method === 'POST' && route === '/cancel') {
           const id = requireSessionId(body.sessionId);

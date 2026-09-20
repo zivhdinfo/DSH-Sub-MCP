@@ -1,8 +1,8 @@
 # DSH-Sub-MCP
 
-**DeepSeek as a sub-agent for Claude Code and Codex CLI.**
+**The DeepSeek Harness as a sub-agent for Claude Code and Codex CLI — on DeepSeek, GLM or any provider you configure there.**
 
-Claude Code (or Codex) stays the parent orchestrator with all of its native capabilities. When you say *"use deepseek for this"*, it delegates a self-contained task to a real DeepSeek agent — one with file and shell tools, running locally inside the [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) — and gets the result back over MCP.
+Claude Code (or Codex) stays the parent orchestrator with all of its native capabilities. When you say *"use deepseek for this"*, it delegates a self-contained task to a real agent — one with file and shell tools, running locally inside the [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) on whichever provider/model you pick (DeepSeek, or a custom route such as GLM added under Settings → Models) — and gets the result back over MCP. It can also hand the parent's own skills (SKILL.md files) to the sub-agent by name.
 
 ```
 Claude Code / Codex CLI
@@ -37,7 +37,7 @@ Everything else happens on that settings page:
 |---|---|
 | Status | Whether a DeepSeek API key is configured (add one under Settings → Models), the MCP endpoint URL, how many delegations are running. **Restart server** relaunches the harness in place (refused while a delegation is running); the page reloads when it is back |
 | Parent agents | **Connect** runs `claude mcp add` / `codex mcp add` for you over **stdio** (auto-start) and installs **usage guidance**: a global skill for Claude Code, a fenced section in Codex's `AGENTS.md`. **Verify** asks the CLI whether the registration is still there. Locates the CLI binaries automatically; safe to click again |
-| Allowed models | A **switch** per model; a model switched off is refused if the parent requests it. **Refresh** re-probes the DeepSeek API |
+| Allowed models | Every provider active in the harness, grouped, with its API-key status, and a **switch** per model (`provider/model`). A model switched off is refused if the parent requests it. With **one** model on, the parent uses it silently; with **two or more**, a call without `model` is refused and the parent must ask you which to use. **Refresh DeepSeek** re-probes the DeepSeek API for retired ids |
 | Recent delegations | Every run with role, model, status, **why it stopped / what it is doing now**, duration, tokens in/out, **cache-hit ratio** and changed files. **Click a row to open that session's conversation**; the chevron shows the task, workspace and session id; a running row has a **Stop** button. Tick rows and **Delete** to drop them from the list and their stored reports (the harness archives the transcript — hidden from the sidebar, never erased) |
 | How to use | The phrases that trigger each tool |
 
@@ -98,14 +98,18 @@ After connecting once, **you never start anything by hand again**: launching Cla
 
 | Tool | Tools available to the agent | Use for |
 |---|---|---|
-| `deepseek_models(refresh?)` | — | Current DeepSeek models, fetched live from the API |
+| `deepseek_models(refresh?)` | — | Every active provider with its models, key status and enabled flags (`enabled` = the usable `provider/model` keys) |
+| `deepseek_skills(workspace?, refresh?)` | — | The parent's skills (SKILL.md files) that can be attached to a delegation by name |
 | `deepseek_research(task, workspace, …)` | `read, read_image, glob, grep` | Analysis, review, exploration — **never writes** |
 | `deepseek_code(task, workspace, allowDirty?, …)` | plus `write, edit, bash, pwsh` | Actual code changes |
 
-Shared options: `model?`, `timeoutSec?` (default 900, max 3600), `maxToolCalls?` (default 150, 20–400), `background?`.
+Shared options: `model?` (`provider/model`), `reasoningEffort?` (default `high`; `max` for hard tasks), `skills?` (names), `timeoutSec?` (default 900, max 3600), `maxToolCalls?` (default 150, 20–400), `background?`.
 
 - `workspace` is **required** and absolute. Claude/Codex fills in its own cwd.
-- `task` must be **self-contained** — the DeepSeek agent cannot see the parent's conversation.
+- `task` must be **self-contained** — the sub-agent cannot see the parent's conversation.
+- `model` is one string, `provider/model` (`deepseek-official/deepseek-flash`, `zai/glm-5.3`). A bare id is accepted only when it is unique across providers. **Ask-first rule:** when more than one model is enabled and `model` is omitted, the call is refused with `MODEL REQUIRED` and the list, so the parent asks the user instead of guessing. `deepseek_continue` never asks — it stays on its session's model unless `model` is passed.
+- `reasoningEffort` is validated against the levels the model offers (`deepseek_models` lists them; DeepSeek: off/low/high/max). Default `high`; the parent's guidance says to use `max` for hard tasks. A continuation keeps the session's previous effort unless one is passed. The header shows it as `effort: …`.
+- `skills: ["name", …]` attaches the parent's own skills (see below).
 - `deepseek_code` **refuses a dirty git tree** (unless `allowDirty: true`) so a rollback point always exists.
 - Every result, including failures, carries `stopReason`, the **session id**, and the list of changed files.
 - `background: true` returns at once with the session id; the agent keeps working and the report is read later with `deepseek_result`.
@@ -153,17 +157,19 @@ Neither CLI is reliably on PATH. The connect buttons look in `~/.local/bin/`, `%
 
 Claude Code is registered at **user scope**, so it works from every repo, not just this directory.
 
-## Live model catalog
+## Model directory
 
-The DSH adapter ships a hardcoded catalog that still lists retired models, so this project **always fetches `GET https://api.deepseek.com/models`** instead:
+Models come from the harness itself, not from a list of our own: `ctx.llm.listProviders()` / `listModels()` give every route with a registered adapter — `deepseek-official` from the DeepSeek adapter plus whatever you declared under Settings → Models (a `zai` route with GLM models, an OpenAI-compatible gateway, …) — and `ctx.credentials.describe()` says whether each route's `apiKeyEnv` is set, exactly as the harness's Models page computes its green dot. A route without a key is shown but not usable; its models cannot be switched on. The directory is cached for 30 s and dropped on `llm/adapters-updated`, `settings/updated` and `credentials/reference-updated`, so an edit in the DSH settings dialog is visible on the next call.
 
-- On boot, the cached catalog (`.dsh-sub/model-catalog.json`) loads immediately and a live probe runs in the background.
-- A model that disappears from the API is kept but marked `listed: false`, with a warning if you use it.
-- A new DeepSeek model **works immediately** — the `model` parameter passes straight through to the adapter.
-- Offline or no key? The cache is used and flagged `catalogStale: true`. The seed list is only a first-run fallback.
-- `deepseek_models({ refresh: true })` forces a re-probe (throttled to 60s).
+The per-model switches live in `.dsh-sub/model-catalog.json` (`{ version: 2, enabled: { "provider/model": true } }`). A model the harness gains later is **off** until you switch it on, so adding a provider with a dozen models does not make every delegation ask which one to use. A pre-1.2 catalog (DeepSeek-only rows) is migrated on boot, as are old history entries (`deepseek-flash` → `deepseek-official/deepseek-flash`).
 
-`GET /models` returns ids only, so modality metadata (image support) lives in `CAPABILITIES` in `src/bootstrap.mjs`. Unknown models default to text-only and fail loudly on image input rather than misbehaving.
+The DSH DeepSeek adapter ships a hardcoded catalog that still lists retired ids, so for `deepseek-official` only, `src/deepseek-live.mjs` still probes `GET https://api.deepseek.com/models` (cached in `.dsh-sub/deepseek-live.json`, background on boot, `deepseek_models({ refresh: true })` or **Refresh DeepSeek** to force, throttled to 60 s). Its result seeds the adapter's model list in `sub.patch.json` and marks a vanished id `listed: false` in the directory. Modality metadata (image support) lives in `CAPABILITIES` in `src/bootstrap.mjs`.
+
+## Skills
+
+The parent can pass `skills: ["docx", "find-skills"]` on `deepseek_research`, `deepseek_code` and `deepseek_continue`. `src/skills.mjs` resolves each name to a `SKILL.md` on disk — workspace `.claude/skills` and `.agents/skills`, `~/.claude/skills` (including `synced/`), `~/.codex/skills` (including `.system/`), `~/.agents/skills`, and the `skills/` folders of installed Claude/Codex plugins; `DSH_SUB_SKILL_DIRS` (`;`-separated) adds more. Only the frontmatter `name`/`description` and the body are used, so Claude Code and Codex skill files work as they are; names are kebab-cased, `plugin:name` picks that plugin's copy, and `deepseek-subagent` itself is never attachable.
+
+Attached skills reach the model the way the harness's own skills do: `delegate.mjs` registers them in the agent's scope (`agentCtx.skills.register`) and mounts `@deepseek-ai/dsh-tool-skill` there, so the session gets an `<available_skills>` catalog (name + description only) and a `skill` tool that loads the full text on demand, with the skill's directory as resource base for its scripts and references. The tool lives in the agent's own layer, so the role's tool restriction does not hide it and nothing changes for other sessions; the task prompt tells the agent which skills were attached and to load them before starting. `deepseek_skills` lists what can be attached; the Status card shows how many were found.
 
 ## Long-running jobs
 
@@ -181,10 +187,12 @@ Cancelling (Esc) in the parent aborts the DeepSeek agent — the bridge turns th
 src/bootstrap.mjs    scaffolds the DSH profile and generates .dsh-sub/sub.patch.json (absolute paths)
 src/serve.mjs        runs the harness (foreground, or background with --no-open)
 src/mcp-stdio.mjs    stdio bridge for Claude/Codex; auto-starts the harness
-src/mcp-plugin.mjs   DSH plugin: /mcp endpoint, the eight tools, run history and results, /dsh-sub JSON for the settings page, /setup launcher
+src/mcp-plugin.mjs   DSH plugin: /mcp endpoint, the nine tools, ask-first rule, run history and results, /dsh-sub JSON for the settings page, /setup launcher
 src/client.js        DSH client plugin: the Settings → Sub-agent page (loaded by the harness, no build step)
-src/delegate.mjs     runs each DeepSeek delegation as a top-level harness session (create or resume), with the loop guard
-src/models.mjs       live /models probe, cache, retirement detection, enable/disable
+src/delegate.mjs     runs each delegation as a top-level harness session (create or resume) on the chosen provider/model, attaches skills, loop guard
+src/models.mjs       model directory: active providers + models from the harness, key status, per-model switches, ask-first
+src/deepseek-live.mjs live DeepSeek /models probe (retired-id detection; seeds the adapter config)
+src/skills.mjs       finds the parent's SKILL.md files and resolves `skills` names
 src/workspace.mjs    workspace validation and git evidence
 .dsh-sub/            private DSH_HOME: profile, credentials, cache, token, logs (git-ignored)
 ```
