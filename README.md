@@ -15,7 +15,7 @@ Claude Code / Codex CLI
                               DeepSeek API (your key)
 ```
 
-`http://127.0.0.1:3083/` is also the **stock DeepSeek Harness GUI** — chat with DeepSeek directly, manage your API key, browse session history. Nothing custom to learn.
+`http://127.0.0.1:3083/` is the **stock DeepSeek Harness GUI** — chat with DeepSeek directly, manage your API key, browse session history. This project adds one page to it: **Settings → Sub-agent**, where you connect Claude Code / Codex, choose the allowed models and watch the delegations. Nothing else to learn.
 
 ## Requirements
 
@@ -29,22 +29,23 @@ Claude Code / Codex CLI
 npm install
 ```
 
-Then double-click **`Start.vbs`** (no console window; opens the control panel), or run `npm start` for a foreground process with live logs.
+Then double-click **`Start.vbs`** (no console window; opens the DSH UI on Settings → Sub-agent), or run `npm start` for a foreground process with live logs.
 
-Everything else happens in the control panel:
+Everything else happens on that settings page:
 
-| Section | What it does |
+| Card | What it does |
 |---|---|
-| 1. API key | Shows whether a key is configured; if not, links to the DSH UI → Settings → Models |
-| 2. Connect a parent agent | **Buttons** that run `claude mcp add` / `codex mcp add` for you over **stdio** (auto-start) and install **usage guidance**: a global skill for Claude Code, a fenced section in Codex's `AGENTS.md`. Locates the CLI binaries automatically; safe to click again |
-| 3. Allowed models | **Checkboxes** to enable/disable each model; a disabled model is refused if requested |
-| 4. Recent delegations | Every run with model, status, **why it stopped / what it is doing now**, duration, tokens in/out, **cache-hit ratio** and changed files; hover a row for the task and session id |
+| Status | Whether a DeepSeek API key is configured (add one under Settings → Models), the MCP endpoint URL, how many delegations are running. **Restart server** relaunches the harness in place (refused while a delegation is running); the page reloads when it is back |
+| Parent agents | **Connect** runs `claude mcp add` / `codex mcp add` for you over **stdio** (auto-start) and installs **usage guidance**: a global skill for Claude Code, a fenced section in Codex's `AGENTS.md`. **Verify** asks the CLI whether the registration is still there. Locates the CLI binaries automatically; safe to click again |
+| Allowed models | A **switch** per model; a model switched off is refused if the parent requests it. **Refresh** re-probes the DeepSeek API |
+| Recent delegations | Every run with role, model, status, **why it stopped / what it is doing now**, duration, tokens in/out, **cache-hit ratio** and changed files. **Click a row to open that session's conversation**; the chevron shows the task, workspace and session id; a running row has a **Stop** button. Tick rows and **Delete** to drop them from the list and their stored reports (the harness archives the transcript — hidden from the sidebar, never erased) |
+| How to use | The phrases that trigger each tool |
 
-The control panel is also reachable from a floating link inside the DSH UI.
+The page is a DSH client plugin (`src/client.js`, declared as `dsh.client` in `package.json`), rendered by the harness's own Settings dialog with its own components and theme; the host half serves it JSON under `/dsh-sub/*`. It is also reachable from any browser as `http://127.0.0.1:3083/setup?key=<mcp token>`, which signs you into the UI and opens the section.
 
 ### Every run is a session in the DSH UI
 
-Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[Research] - <project folder>: …` or `[Code] - <project folder>: …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically.
+Each delegation runs as an ordinary top-level harness session: it appears in the DSH sidebar grouped under your repo's workspace, titled `[Research] - <project folder>: …` or `[Code] - <project folder>: …`, and you can open it to read the full transcript and every tool call. The repo is registered as a workspace automatically and the session is attached to it explicitly (the registry only groups sessions that were attached; on boot, runs recorded by earlier versions are attached retroactively so nothing stays under "Ungrouped").
 
 **Stopping a run:** from the parent, `deepseek_cancel` (or Esc on a foreground call); from the DSH UI, open the session and press **Stop** in the composer. Both call the same `agent.cancel` the harness uses for its own sessions, which aborts the turn and kills any command the agent is running (verified: a `Start-Sleep 120` was killed at cancel time and the tool returned `stopReason: aborted`). The MCP result carries the changed-file evidence and the reason. A stopped session is not dead: `deepseek_continue` resumes it with its memory intact — also while it is open in the UI, since opening a session there turns it into a live agent the UI keeps; the follow-up then runs on that agent and you watch it in the UI.
 
@@ -133,7 +134,7 @@ The **loop guard** is cooperative rather than a kill switch:
 - **Repeats** — the same call three times within the last 12 calls **with no file edit in between** is blocked (its result cannot change). Edit → typecheck → edit → typecheck is fine.
 - After three blocked calls the run is stopped, and the record says why (`tool-call-limit` / `repeat-loop`).
 
-Every early stop carries its reason in the result, the sessions list and the control panel: timeout, loop guard, `deepseek_cancel`, or the parent disconnecting.
+Every early stop carries its reason in the result, the sessions list and the settings page: timeout, loop guard, `deepseek_cancel`, or the parent disconnecting.
 
 ## Auto-start
 
@@ -180,7 +181,8 @@ Cancelling (Esc) in the parent aborts the DeepSeek agent — the bridge turns th
 src/bootstrap.mjs    scaffolds the DSH profile and generates .dsh-sub/sub.patch.json (absolute paths)
 src/serve.mjs        runs the harness (foreground, or background with --no-open)
 src/mcp-stdio.mjs    stdio bridge for Claude/Codex; auto-starts the harness
-src/mcp-plugin.mjs   DSH plugin: /mcp endpoint, /setup control panel, the eight tools, run history and results
+src/mcp-plugin.mjs   DSH plugin: /mcp endpoint, the eight tools, run history and results, /dsh-sub JSON for the settings page, /setup launcher
+src/client.js        DSH client plugin: the Settings → Sub-agent page (loaded by the harness, no build step)
 src/delegate.mjs     runs each DeepSeek delegation as a top-level harness session (create or resume), with the loop guard
 src/models.mjs       live /models probe, cache, retirement detection, enable/disable
 src/workspace.mjs    workspace validation and git evidence
@@ -196,11 +198,12 @@ src/workspace.mjs    workspace validation and git evidence
 | `...cannot be used as the workspace` | You pointed `workspace` at this project's own directory. Use another repo. |
 | Claude Code does not list the server | Connect button not clicked yet. Check with `/mcp`. |
 | Connect button cannot find a CLI | Installed somewhere unusual. Run `claude mcp add` / `codex mcp add` manually with the command shown on the page. |
+| Settings has no Sub-agent entry | The client bundle failed to load; `.dsh-sub/web.err.log` names the `client-modules` error. |
 
 Logs: `.dsh-sub/web.out.log`, `.dsh-sub/web.err.log` (may contain private data).
 
 ## Security notes
 
 - The MCP endpoint binds to `127.0.0.1` only, requires a bearer token, and rejects any request carrying an `Origin` header (blocks DNS-rebinding from a browser).
-- The control panel needs the same token (`/setup?key=...`) or an authenticated DSH browser session.
+- The settings page API (`/dsh-sub/*`) and the `/setup` launcher accept the same token (`?key=...`) or the signed browser-session cookie the DSH UI holds; cross-origin requests are refused.
 - Nothing in `.dsh-sub/` is committed: it holds your API key, session data, and the MCP token.

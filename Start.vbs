@@ -1,6 +1,6 @@
-' Windowless launcher: starts the harness in the background and opens the control
-' panel. Double-click this instead of a .cmd so no console window ever appears.
-' (`npm start` remains the foreground variant for watching logs.)
+' Windowless launcher: starts the harness in the background and opens the DSH UI
+' on Settings -> DeepSeek Sub-agent. Double-click this instead of a .cmd so no
+' console window ever appears. (`npm start` is the foreground variant for logs.)
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 root = fso.GetParentFolderName(WScript.ScriptFullName)
@@ -9,7 +9,8 @@ root = fso.GetParentFolderName(WScript.ScriptFullName)
 shell.CurrentDirectory = root
 shell.Run "node """ & root & "\src\serve.mjs"" --no-open", 0, False
 
-' Wait for the control panel to answer before opening a browser at it.
+' Wait for the launcher page to answer before opening a browser at it. /setup
+' swaps the MCP token for the harness's own browser session and lands in the UI.
 tokenFile = root & "\.dsh-sub\mcp-token.txt"
 url = ""
 For i = 1 To 90

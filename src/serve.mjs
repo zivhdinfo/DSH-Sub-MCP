@@ -15,6 +15,13 @@ function portFree(p) {
   });
 }
 
+// `--wait`: the restart button in the settings page launches us while the old
+// harness is still shutting down, so give the port a moment to free up.
+if (process.argv.includes('--wait')) {
+  const deadline = Date.now() + 30000;
+  while (!(await portFree(port)) && Date.now() < deadline) await new Promise(r => setTimeout(r, 300));
+}
+
 if (!(await portFree(port))) {
   console.error(`\nPort ${port} is busy — DSH-Sub-MCP may already be running in another window.`);
   console.error('Close that window (or Ctrl+C) and run again.\n');
@@ -53,9 +60,11 @@ child.stdout.on('data', chunk => {
   if (!match) return;
   opened = true;
   // The plugin writes this during boot, before the harness announces its URL.
+  // /setup exchanges the MCP token for the harness's own browser session and
+  // lands in the DSH UI with Settings → DeepSeek Sub-agent open.
   const key = readFileSync(path.join(home, 'mcp-token.txt'), 'utf8').trim();
   const setupUrl = `http://127.0.0.1:${port}/setup?key=${key}`;
-  console.log(`\n  Control panel : ${setupUrl}`);
+  console.log(`\n  Settings page : ${setupUrl}`);
   console.log(`  Chat UI       : ${match[1]}`);
   console.log(`  MCP endpoint  : http://127.0.0.1:${port}/mcp`);
   console.log('\n  Ctrl+C to stop.\n');

@@ -289,15 +289,47 @@ export class Delegator {
     });
   }
 
-  // Register the repo as a workspace so runs group under it in the sidebar
-  // instead of landing in "Ungrouped".
+  // Register the repo as a workspace so runs can group under it in the sidebar
+  // instead of landing in "Ungrouped". `create` returns the existing record
+  // when the directory already has one.
   async ensureWorkspace(workspace) {
     const registry = this.ctx.workspaceRegistry;
-    if (!registry) return;
+    if (!registry) return undefined;
     try {
-      if (await registry.resolveByPath(workspace)) return;
-      await registry.create(workspace, path.basename(workspace));
-    } catch { /* grouping is cosmetic; never block a run on it */ }
+      return (await registry.resolveByPath(workspace)) ?? await registry.create(workspace, path.basename(workspace));
+    } catch { return undefined; /* grouping is cosmetic; never block a run on it */ }
+  }
+
+  // Having a workspace is not enough: a session only joins one when something
+  // attaches it explicitly (the UI's session controller and the webhook both
+  // do), and the registry validates the session's stored cwd against the
+  // workspace path when it does. Idempotent, so a resumed session is fine.
+  async attachToWorkspace(entity, sessionId) {
+    if (!entity) return;
+    try { await entity.attachSession(sessionId); } catch { /* cosmetic */ }
+  }
+
+  // Group already-recorded sessions under their workspaces (boot-time repair
+  // for runs made before sessions were attached). `pairs` is sessionId → path.
+  async adoptSessions(pairs) {
+    if (!this.ctx.workspaceRegistry) return;
+    const entities = new Map();
+    for (const [sessionId, workspace] of pairs) {
+      if (!entities.has(workspace)) entities.set(workspace, await this.ensureWorkspace(workspace));
+      await this.attachToWorkspace(entities.get(workspace), sessionId);
+    }
+  }
+
+  // Hide sessions from the sidebar the way its own "Archive session" does; the
+  // transcript stays on disk. Returns the ids the registry accepted.
+  async archiveSessions(sessionIds) {
+    const registry = this.ctx.workspaceRegistry;
+    if (!registry) return [];
+    const done = [];
+    for (const id of sessionIds) {
+      try { await registry.archiveSession(brandString(id)); done.push(id); } catch { /* unknown to the harness */ }
+    }
+    return done;
   }
 
   get(sessionId) { return this.runs.get(sessionId); }
@@ -326,7 +358,7 @@ export class Delegator {
     let handle;
     const detach = [];
     try {
-      if (!resumeSessionId) await this.ensureWorkspace(workspace);
+      const workspaceEntity = await this.ensureWorkspace(workspace);
 
       // Same composition the subagent driver applies in the child's creation
       // window: a persona section and a scoped tool restriction.
@@ -365,6 +397,7 @@ export class Delegator {
         agent = handle.agent;
       }
       run.agent = agent;
+      await this.attachToWorkspace(workspaceEntity, sessionId);
       if (borrowed) run.model = agent.options?.model ?? model;
       for (const [reason, signal] of Object.entries(signals)) {
         if (!signal) continue;

@@ -2,8 +2,8 @@
 // Claude Code or Codex CLI (the parent) can delegate work to them.
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { existsSync, readdirSync } from 'node:fs';
+import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -17,6 +17,8 @@ export const name = 'deepseek-sub-mcp';
 export const inject = ['webServer', 'credentials', 'agents', 'tools', 'connection', 'workspaceRegistry', 'sessionTitle'];
 
 const ROUTE = '/mcp';
+// Fragment the launcher appends so the client plugin opens our Settings section.
+const SETTINGS_HASH = '#settings/deepseek-subagent';
 const MAX_BODY = 1 << 20;
 const DEFAULT_TIMEOUT_SEC = 900;
 // How often a running foreground call reports progress to the parent even when
@@ -62,7 +64,7 @@ const fmt = n => Number(n ?? 0).toLocaleString('en-US');
 
 function describeUsage(usage) {
   if (!usage) return 'tokens: (accounting not available)';
-  if (usage.pending) return 'tokens: accounting still settling — see the control panel for final numbers';
+  if (usage.pending) return 'tokens: accounting still settling — see Settings → Sub-agent in the DSH UI for final numbers';
   const pct = (usage.cacheHitRatio * 100).toFixed(1);
   return `tokens: ${fmt(usage.inputTokens)} in (${pct}% cache hit, ${fmt(usage.uncachedInputTokens)} uncached) / ${fmt(usage.outputTokens)} out`;
 }
@@ -124,6 +126,20 @@ class History {
     if (changed) await this.persist();
   }
   recent(n = 30) { return this.entries.slice(-n).reverse(); }
+  // Forget every turn of the given sessions. Callers refuse running ones first.
+  async remove(sessionIds) {
+    const drop = new Set(sessionIds);
+    const before = this.entries.length;
+    this.entries = this.entries.filter(e => !drop.has(e.sessionId));
+    if (this.entries.length !== before) await this.persist();
+    return before - this.entries.length;
+  }
+  // Distinct (workspace, sessionId) pairs, newest last, for sidebar grouping.
+  sessionWorkspaces() {
+    const pairs = new Map();
+    for (const e of this.entries) if (e.sessionId && e.workspace) pairs.set(e.sessionId, e.workspace);
+    return pairs;
+  }
 }
 
 // The agent's final report, kept per session so the parent can read it after
@@ -134,6 +150,9 @@ async function saveResult(sessionId, result) {
 }
 async function loadResult(sessionId) {
   try { return JSON.parse(await readFile(path.join(resultsDir, `${sessionId}.json`), 'utf8')); } catch { return null; }
+}
+async function deleteResult(sessionId) {
+  await rm(path.join(resultsDir, `${sessionId}.json`), { force: true });
 }
 
 function describeChanges(before, after) {
@@ -175,6 +194,10 @@ export async function apply(ctx) {
   await history.load();
   // Warm the catalog from the live API without blocking boot.
   catalog.refresh(resolveKey).catch(() => {});
+  // Earlier versions created the workspace but never attached the session to
+  // it, so their runs sit under "Ungrouped" in the sidebar. Adopt them once
+  // the harness is up; attaching is idempotent.
+  setTimeout(() => delegator.adoptSessions(history.sessionWorkspaces()).catch(() => {}), 3000).unref?.();
 
   const text = (body, isError = false) => ({ content: [{ type: 'text', text: body }], isError });
   const json = value => text(JSON.stringify(value, null, 2));
@@ -548,8 +571,6 @@ export async function apply(ctx) {
     return server;
   }
 
-  const escape = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-
   const mcpUrl = () => `http://127.0.0.1:${ctx.webServer.port}/mcp`;
 
   // Neither CLI is reliably on PATH: Claude Code's native installer drops it in
@@ -620,10 +641,14 @@ export async function apply(ctx) {
     claude: path.join(projectRoot, 'skills', 'claude', 'deepseek-subagent', 'SKILL.md'),
     codex: path.join(projectRoot, 'skills', 'codex', 'AGENTS.snippet.md'),
   };
+  const guidanceDest = {
+    claude: () => path.join(process.env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude'), 'skills', 'deepseek-subagent', 'SKILL.md'),
+    codex: () => path.join(process.env.CODEX_HOME || path.join(homeDir, '.codex'), 'AGENTS.md'),
+  };
+  const CODEX_FENCE = /<!-- dsh-sub-mcp:start -->[\s\S]*?<!-- dsh-sub-mcp:end -->/;
 
   async function installClaudeSkill() {
-    const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude');
-    const dest = path.join(configDir, 'skills', 'deepseek-subagent', 'SKILL.md');
+    const dest = guidanceDest.claude();
     await mkdir(path.dirname(dest), { recursive: true });
     await writeFile(dest, await readFile(skillSources.claude, 'utf8'));
     return dest;
@@ -633,17 +658,24 @@ export async function apply(ctx) {
   // The snippet is fenced with markers so re-installing replaces rather than
   // duplicates, and the user's own content around it is left untouched.
   async function installCodexInstructions() {
-    const dest = path.join(process.env.CODEX_HOME || path.join(homeDir, '.codex'), 'AGENTS.md');
+    const dest = guidanceDest.codex();
     const snippet = (await readFile(skillSources.codex, 'utf8')).trim();
     let existing = '';
     try { existing = await readFile(dest, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    const fenced = /<!-- dsh-sub-mcp:start -->[\s\S]*?<!-- dsh-sub-mcp:end -->/;
-    const next = fenced.test(existing)
-      ? existing.replace(fenced, snippet)
+    const next = CODEX_FENCE.test(existing)
+      ? existing.replace(CODEX_FENCE, snippet)
       : (existing.trimEnd() + (existing.trim() ? '\n\n' : '') + snippet + '\n');
     await mkdir(path.dirname(dest), { recursive: true });
     await writeFile(dest, next);
     return dest;
+  }
+
+  // Whether the guidance is on disk right now — the panel shows this next to
+  // each parent so a fresh machine (or a deleted skill) is visible at a glance.
+  function guidanceInstalled(target) {
+    const dest = guidanceDest[target]();
+    if (target === 'claude') return existsSync(dest);
+    try { return CODEX_FENCE.test(readFileSync(dest, 'utf8')); } catch { return false; }
   }
 
   // Runs the parent agent's own CLI so registration lands wherever that CLI keeps
@@ -678,121 +710,90 @@ export async function apply(ctx) {
     return { ...result, exe };
   }
 
-  function setupPage({ keyConfigured, snapshot, found, runs, totalRuns }) {
-    const runRow = r => {
-      const u = r.usage;
-      const when = new Date(r.time).toLocaleTimeString('en-GB', { hour12: false });
-      const running = r.status === 'running';
-      const live = running ? delegator.get(r.sessionId) : null;
-      const status = r.status === 'completed'
-        ? '<span class=ok>completed</span>'
-        : running
-          ? '<span class=warn>running</span>'
-          : `<span class=bad>${escape(r.status)}</span>`;
-      const reason = live
-        ? `${live.guard.calls} calls · ${escape(live.guard.last?.summary ?? 'starting')}`
-        : escape(r.reason ?? r.error ?? '');
-      const seconds = running ? (Date.now() - Date.parse(r.time)) / 1000 : (r.durationMs ?? 0) / 1000;
-      const turn = (r.turn ?? 1) > 1 ? ` <span class=muted>t${escape(r.turn)}</span>` : '';
-      return `<tr title="${escape(r.task)}&#10;session ${escape(r.sessionId ?? '')}">
-<td>${escape(when)}</td><td>${escape(r.role)}${turn}</td><td><code>${escape(r.model)}</code></td><td>${status}</td>
-<td class=muted style="max-width:16rem">${reason}</td>
-<td>${seconds.toFixed(0)}s</td>
-<td>${u ? `${fmt(u.inputTokens)} / ${fmt(u.outputTokens)}` : '—'}</td>
-<td>${u ? `<span class=${u.cacheHitRatio >= 0.5 ? 'ok' : 'warn'}>${(u.cacheHitRatio * 100).toFixed(0)}%</span>` : '—'}</td>
-<td>${r.changedFiles ?? '—'}</td></tr>`;
+  // Asks the CLI itself whether the registration is still there, so the panel
+  // reports what the parent will actually see rather than what we last wrote.
+  async function runVerify(target) {
+    const exe = resolveCli(target);
+    const result = await runCli(exe, ['mcp', 'get', 'deepseek']);
+    return { ...result, exe };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Control panel. The UI itself is src/client.js, a DSH client plugin that adds
+  // a "DeepSeek Sub-agent" section to the harness's own Settings dialog; these
+  // routes are the JSON it reads and writes. They accept the MCP token (?key=)
+  // or the browser session cookie the DSH UI already holds, so the section
+  // needs no credentials of its own.
+  // ---------------------------------------------------------------------------
+
+  const API = '/dsh-sub';
+
+  // The cross-run table: newest first, live runs carrying their current
+  // progress instead of the (not yet known) final numbers.
+  function runRows(n = 40) {
+    return history.recent(n).map(r => {
+      const live = r.status === 'running' ? delegator.get(r.sessionId) : null;
+      const s = live ? live.snapshot() : null;
+      return {
+        id: r.id,
+        sessionId: r.sessionId ?? null,
+        time: r.time,
+        role: r.role,
+        turn: r.turn ?? 1,
+        model: r.model,
+        status: r.status,
+        reason: r.reason ?? r.error ?? null,
+        durationMs: r.status === 'running' ? Date.now() - Date.parse(r.time) : (r.durationMs ?? null),
+        toolCalls: s ? s.toolCalls : (r.toolCalls ?? null),
+        lastTool: s ? s.lastTool : null,
+        stopping: s ? s.abortRequested : null,
+        usage: r.usage
+          ? { inputTokens: r.usage.inputTokens ?? 0, outputTokens: r.usage.outputTokens ?? 0, cacheHitRatio: r.usage.cacheHitRatio ?? 0, pending: r.usage.pending === true }
+          : null,
+        changedFiles: r.changedFiles ?? null,
+        task: r.task,
+        workspace: r.workspace,
+        background: r.background ?? false,
+      };
+    });
+  }
+
+  async function panelState() {
+    await history.settle(home);
+    const keyConfigured = await resolveKey().then(Boolean).catch(() => false);
+    // Never block the panel on the network: hand back what we have and let the
+    // (throttled) probe update the cache for the next poll.
+    if (keyConfigured) catalog.refresh(resolveKey).catch(() => {});
+    return {
+      now: new Date().toISOString(),
+      port: ctx.webServer.port,
+      mcpUrl: mcpUrl(),
+      home,
+      key: { configured: keyConfigured },
+      catalog: catalog.snapshot(),
+      agents: {
+        claude: { cli: cliCandidates('claude')[0] ?? null, guidance: guidanceDest.claude(), guidanceInstalled: guidanceInstalled('claude') },
+        codex: { cli: cliCandidates('codex')[0] ?? null, guidance: guidanceDest.codex(), guidanceInstalled: guidanceInstalled('codex') },
+      },
+      runs: runRows(),
+      totalRuns: history.entries.length,
+      running: delegator.list().length,
     };
-    const row = m => `<tr>
-<td><label><input type=checkbox data-model="${escape(m.model)}" ${m.enabled === false ? '' : 'checked'}
- ${m.listed ? '' : 'disabled'}> <code>${escape(m.model)}</code></label></td>
-<td>${escape(m.label)}</td>
-<td>${m.listed ? '<span class=ok>serving</span>' : '<span class=warn>left the API</span>'}</td></tr>`;
-    return `<!doctype html><meta charset=utf-8><title>DSH-Sub-MCP</title>
-<style>
-:root{color-scheme:light dark}
-body{font:15px/1.6 system-ui,sans-serif;max-width:50rem;margin:2.5rem auto;padding:0 1rem}
-h1{font-size:1.4rem;margin:0 0 .2rem}h2{font-size:1rem;margin:1.8rem 0 .5rem}
-.sub{opacity:.65;margin:0 0 1.5rem}
-.card{border:1px solid color-mix(in srgb,currentColor 18%,transparent);border-radius:10px;padding:.9rem 1.1rem;margin:.6rem 0}
-button{font:inherit;padding:.35rem .9rem;border-radius:6px;border:1px solid color-mix(in srgb,currentColor 30%,transparent);background:transparent;color:inherit;cursor:pointer;margin-right:.5rem}
-button:hover:not(:disabled){background:color-mix(in srgb,currentColor 10%,transparent)}
-button:disabled{opacity:.5;cursor:default}
-table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.35rem .5rem;border-bottom:1px solid color-mix(in srgb,currentColor 12%,transparent)}
-pre{background:color-mix(in srgb,currentColor 7%,transparent);padding:.6rem .8rem;border-radius:6px;white-space:pre-wrap;word-break:break-all;font-size:.85em;margin:.5rem 0 0}
-.ok{color:#15803d}.warn{color:#b45309}.bad{color:#b91c1c}
-@media(prefers-color-scheme:dark){.ok{color:#4ade80}.warn{color:#fbbf24}.bad{color:#f87171}}
-a{color:inherit}.muted{opacity:.65;font-size:.9em}
-</style>
-<h1>DSH-Sub-MCP</h1>
-<p class=sub>DeepSeek as a sub-agent for Claude Code / Codex CLI · <a href="/">open the DSH UI</a></p>
+  }
 
-<h2>1. DeepSeek API key</h2>
-<div class=card>${keyConfigured
-  ? '<span class=ok>&#10003; Configured.</span>'
-  : '<span class=bad>&#10007; No key yet.</span> Open the <a href="/">DSH UI</a> &rarr; Settings &rarr; Models to add one, then reload this page.'}</div>
-
-<h2>2. Connect a parent agent</h2>
-<div class=card>
-<button onclick="reg('claude',this)">Connect Claude Code</button>
-<button onclick="reg('codex',this)">Connect Codex CLI</button>
-<pre id=log style="display:none"></pre>
-<p class=muted style="margin-bottom:0">
-Claude Code: ${found.claude ? '<span class=ok>' + escape(found.claude) + '</span>' : '<span class=warn>not found — will try PATH</span>'}<br>
-Codex CLI: ${found.codex ? '<span class=ok>' + escape(found.codex) + '</span>' : '<span class=warn>not found — will try PATH</span>'}<br>
-Registers over <b>stdio</b> (the parent launches this server itself next time) and installs <b>usage guidance</b>: a global skill for Claude Code (<code>~/.claude/skills/deepseek-subagent/</code>) or a fenced section in Codex's <code>~/.codex/AGENTS.md</code>, so the parent knows when and how to delegate.
-Click again at any time to refresh both.</p>
-</div>
-
-<h2>3. Allowed models</h2>
-<div class=card>
-<table><tr><th>Enabled</th><th>Name</th><th>Status</th></tr>${snapshot.models.map(row).join('')}</table>
-<p class=muted style="margin-bottom:0">Default: <code id=def>${escape(snapshot.defaultModel)}</code> ·
-${snapshot.catalogStale ? 'not yet verified against the API' : 'synced at ' + escape(snapshot.catalogCheckedAt)}
-${snapshot.message ? '<br>' + escape(snapshot.message) : ''}<br>
-A disabled model is refused if Claude/Codex requests it.</p>
-</div>
-
-<h2>4. Recent delegations</h2>
-<div class=card>
-${runs.length ? `<table><tr><th>When</th><th>Role</th><th>Model</th><th>Status</th><th>Why / now</th><th>Time</th><th>Tokens in / out</th><th>Cache hit</th><th>Files</th></tr>${runs.map(runRow).join('')}</table>
-<p class=muted style="margin-bottom:0">${escape(runs.length)} most recent, of ${escape(totalRuns)} recorded. Hover a row for the task and session id. Sessions live under <code>.dsh-sub/sessions/</code>; add the workspace in the DSH sidebar to browse them there. Reports are kept in <code>.dsh-sub/results/</code> and any finished session can be resumed with <code>deepseek_continue</code>.</p>`
-  : '<span class=muted>No delegations yet. They will appear here as Claude/Codex calls the tools.</span>'}
-</div>
-
-<h2>How to use</h2>
-<div class=card>In Claude Code, just ask naturally:<br>
-<em>"use deepseek to review the auth module for bugs"</em> &rarr; <code>deepseek_research</code><br>
-<em>"use deepseek to fix that bug"</em> &rarr; <code>deepseek_code</code><br>
-<em>"ask deepseek to carry on where it stopped"</em> &rarr; <code>deepseek_continue</code><br>
-<em>"what is deepseek doing?"</em> &rarr; <code>deepseek_sessions</code> / <code>deepseek_result</code> / <code>deepseek_steer</code> / <code>deepseek_cancel</code><br><br>
-Long jobs: pass <code>background: true</code> and read the report later with <code>deepseek_result</code>.
-The server starts on demand. To stop it fully, end the node process holding port ${ctx.webServer.port}.</div>
-
-<script>
-const KEY = new URLSearchParams(location.search).get('key') || '';
-async function post(path, body){
-  const r = await fetch(path + '?key=' + encodeURIComponent(KEY), {
-    method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
-  return r.json();
-}
-async function reg(target, btn){
-  const log = document.getElementById('log');
-  btn.disabled = true; const label = btn.textContent; btn.textContent = 'Connecting...';
-  try{
-    const r = await post('/setup/register', {target});
-    log.style.display='block';
-    log.textContent = (r.ok ? '✓ ' : '✗ ') + target + ': ' + (r.output || '');
-  } catch(e){ log.style.display='block'; log.textContent = '✗ ' + e; }
-  btn.disabled = false; btn.textContent = label;
-}
-document.querySelectorAll('input[data-model]').forEach(box => {
-  box.addEventListener('change', async () => {
-    const r = await post('/setup/model', {model: box.dataset.model, enabled: box.checked});
-    if (r.error){ box.checked = !box.checked; alert(r.error); return; }
-    document.getElementById('def').textContent = r.defaultModel;
-  });
-});
-</script>`;
+  // Relaunch: a detached serve.mjs waits for the port to free and boots a fresh
+  // harness; this process exits once the reply is out, and the serve.mjs that
+  // spawned us follows (it exits with its child). Same detached recipe as the
+  // stdio bridge, so no console window appears.
+  function scheduleRestart() {
+    const child = spawn(process.execPath, [path.join(projectRoot, 'src', 'serve.mjs'), '--no-open', '--wait'], {
+      cwd: projectRoot,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    setTimeout(() => process.exit(0), 500).unref();
   }
 
   function authorized(req) {
@@ -803,66 +804,99 @@ document.querySelectorAll('input[data-model]').forEach(box => {
     return keyOk || !ctx.connection.requestRejection(req);
   }
 
-  const disposeSetup = ctx.webServer.register({
+  const disposeApi = ctx.webServer.register({
     kind: 'prefix',
-    path: '/setup',
+    path: API,
     async handler(req, res) {
-      // The page displays the bearer token, so it needs that same token to open —
-      // the model the harness already uses for its own ?token= URLs. An existing
-      // authenticated browser session is accepted too.
-      if (!authorized(req)) {
-        res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end('Not authenticated. Reopen the /setup?key=... link printed by the terminal.');
-        return;
-      }
-      const route = new URL(req.url, 'http://127.0.0.1').pathname;
       const json = (status, value) => {
-        res.writeHead(status, { 'content-type': 'application/json' });
+        res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         res.end(JSON.stringify(value));
       };
+      if (!authorized(req)) return json(401, { error: 'not authenticated' });
+      // The bearer route already refuses cross-origin; the panel API does too,
+      // for the same DNS-rebinding reason.
+      const origin = req.headers.origin;
+      if (origin && new URL(origin).host !== req.headers.host) return json(403, { error: 'origin not allowed' });
 
-      if (req.method === 'POST' && route === '/setup/register') {
-        const { target } = await readJson(req).catch(() => ({}));
-        if (target !== 'claude' && target !== 'codex') return json(400, { error: 'invalid target' });
-        return json(200, await runRegister(target));
-      }
+      const route = new URL(req.url, 'http://127.0.0.1').pathname.slice(API.length) || '/';
+      const body = req.method === 'POST' ? await readJson(req).catch(() => ({})) : {};
+      const target = body.target;
+      const validTarget = target === 'claude' || target === 'codex';
 
-      if (req.method === 'POST' && route === '/setup/model') {
-        const { model, enabled } = await readJson(req).catch(() => ({}));
-        try {
-          const snapshot = await catalog.setEnabled(model, enabled === true);
-          return json(200, { defaultModel: snapshot.defaultModel });
-        } catch (error) {
-          return json(200, { error: String(error.message || error) });
+      try {
+        if (req.method === 'GET' && route === '/state') return json(200, await panelState());
+        if (req.method === 'POST' && route === '/register') {
+          if (!validTarget) return json(400, { error: 'invalid target' });
+          return json(200, await runRegister(target));
         }
-      }
-
-      if (req.method !== 'GET' || route !== '/setup') {
+        if (req.method === 'POST' && route === '/verify') {
+          if (!validTarget) return json(400, { error: 'invalid target' });
+          return json(200, await runVerify(target));
+        }
+        if (req.method === 'POST' && route === '/model') {
+          const snapshot = await catalog.setEnabled(body.model, body.enabled === true);
+          return json(200, { catalog: snapshot });
+        }
+        if (req.method === 'POST' && route === '/models/refresh') {
+          return json(200, { catalog: await catalog.refresh(resolveKey, { force: true }) });
+        }
+        if (req.method === 'POST' && route === '/cancel') {
+          const id = requireSessionId(body.sessionId);
+          const run = delegator.get(id);
+          if (!run) return json(200, { ok: false, message: `Session ${id} is not running.` });
+          const first = run.stop('cancelled');
+          return json(200, { ok: true, message: first ? 'Cancel requested.' : `Already stopping (${run.abortReason}).` });
+        }
+        if (req.method === 'POST' && route === '/delete') {
+          if (!Array.isArray(body.sessionIds) || body.sessionIds.length > 100) return json(400, { error: 'sessionIds must be a list' });
+          const ids = body.sessionIds.map(requireSessionId);
+          const running = ids.filter(id => delegator.get(id));
+          if (running.length) return json(200, { error: `${running.length} of the selected sessions are still running. Stop them first.` });
+          // The harness never erases a transcript; "archive" is what its own
+          // sidebar menu does, and the same thing hides it here. Our record
+          // and the stored report go for real.
+          const archived = await delegator.archiveSessions(ids);
+          const removed = await history.remove(ids);
+          await Promise.all(ids.map(id => deleteResult(id).catch(() => {})));
+          return json(200, { ok: true, removed, archived: archived.length, notArchived: ids.length - archived.length });
+        }
+        if (req.method === 'POST' && route === '/restart') {
+          const live = delegator.list().length;
+          if (live) return json(200, { error: `${live} delegation${live === 1 ? ' is' : 's are'} still running. Stop them first.` });
+          json(200, { ok: true });
+          scheduleRestart();
+          return;
+        }
         return json(404, { error: 'not found' });
+      } catch (error) {
+        return json(200, { error: String(error.message || error) });
       }
-
-      await history.settle(home);
-      const keyConfigured = await resolveKey().then(Boolean).catch(() => false);
-      const snapshot = keyConfigured ? await catalog.refresh(resolveKey) : catalog.snapshot();
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(setupPage({
-        keyConfigured,
-        snapshot,
-        found: { claude: cliCandidates("claude")[0] ?? null, codex: cliCandidates("codex")[0] ?? null },
-        runs: history.recent(30),
-        totalRuns: history.entries.length,
-      }));
     },
   });
 
-  // Put the entry point inside the DSH interface itself, the same way DSH Team
-  // surfaces its dashboard, so this is not a page you can only reach from a URL.
-  const disposeTap = ctx.webServer.tapIndex(html => html.replace(
-    '</body>',
-    `<a href="/setup?key=${token}" style="position:fixed;right:14px;bottom:14px;z-index:99999;`
-    + 'font:13px system-ui,sans-serif;padding:.45rem .8rem;border-radius:999px;text-decoration:none;'
-    + 'background:#1f2937;color:#fff;opacity:.85;box-shadow:0 2px 8px #0004">DeepSeek sub-agent</a></body>',
-  ));
+  // The launcher URL Start.vbs and `npm start` open. It carries the MCP token,
+  // exchanges it for the harness's own launch token, and lands in the DSH UI
+  // with a fragment that tells the client plugin to open our Settings section.
+  // A page rather than a 302 so the launcher's readiness probe sees a plain 200.
+  const disposeSetup = ctx.webServer.register({
+    kind: 'exact',
+    path: '/setup',
+    async handler(req, res) {
+      if (!authorized(req)) {
+        res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Not authenticated. Reopen the /setup?key=... link printed by the terminal, or open the DSH UI and choose Settings → DeepSeek Sub-agent.');
+        return;
+      }
+      const target = ctx.connection.authenticatedUrl(`http://127.0.0.1:${ctx.webServer.port}/`) + SETTINGS_HASH;
+      const safe = JSON.stringify(target).replaceAll('<', '\\u003c');
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' });
+      res.end(`<!doctype html><meta charset=utf-8><title>DSH-Sub-MCP</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{font:15px/1.6 system-ui,sans-serif;color:#555;display:grid;place-items:center;height:100vh;margin:0}a{color:inherit}</style>
+<p>Opening DeepSeek Harness → Settings → DeepSeek Sub-agent… <a id=l>continue</a></p>
+<script>const u=${safe};document.getElementById('l').href=u;location.replace(u)</script>`);
+    },
+  });
 
   const dispose = ctx.webServer.register({
     kind: 'exact',
@@ -924,5 +958,5 @@ document.querySelectorAll('input[data-model]').forEach(box => {
     },
   });
 
-  ctx.on('dispose', () => { dispose(); disposeSetup(); disposeTap?.(); });
+  ctx.on('dispose', () => { dispose(); disposeApi(); disposeSetup(); });
 }

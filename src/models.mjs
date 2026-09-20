@@ -145,7 +145,7 @@ export class Catalog {
       throw new Error(`Model "${requested}" is not in DeepSeek's current catalog. Available: ${available}. Call deepseek_models for the latest list.`);
     }
     if (hit.enabled === false) {
-      throw new Error(`Model "${hit.model}" is disabled in the control panel. Enabled: ${this.usableModels().map(m => m.model).join(', ') || '(none)'}.`);
+      throw new Error(`Model "${hit.model}" is switched off in the DSH UI (Settings → Sub-agent). Enabled: ${this.usableModels().map(m => m.model).join(', ') || '(none)'}.`);
     }
     return {
       model: hit.model,

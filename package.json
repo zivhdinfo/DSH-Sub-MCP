@@ -1,9 +1,23 @@
 {
   "name": "dsh-sub-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "DeepSeek subagents exposed to Claude Code / Codex CLI over MCP, running inside the DSH harness",
+  "exports": {
+    ".": "./src/mcp-plugin.mjs",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
   "scripts": {
     "bootstrap": "node src/bootstrap.mjs",
     "start": "node src/serve.mjs"
